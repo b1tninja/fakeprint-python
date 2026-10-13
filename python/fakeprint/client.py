@@ -9,12 +9,16 @@ conditions and injection rules) and ``/v1/timing``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 DEFAULT_BASE_URL = "http://127.0.0.1:3921"
+
+# Server-wide routes of the device manager: never prefixed with /d/<id>.
+_SERVER_WIDE = re.compile(r"^/v1/(devices|profiles|registry|queue|reconcile)(/|$)")
 
 
 class ApiError(httpx.HTTPStatusError):
@@ -31,10 +35,12 @@ class Capture:
     bytes: int
     document_format: str
     peer: str
+    document_id: int = 1
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Capture:
         return cls(
+            document_id=int(d.get("document_id", 1)),
             job_id=int(d["job_id"]),
             path=str(d["path"]),
             meta_path=str(d.get("meta_path", "")),
@@ -122,6 +128,11 @@ class Status:
         return str(self.raw.get("device_uuid", ""))
 
     @property
+    def device_id(self) -> str:
+        """The multi-device id this status belongs to (``""`` from a library without devices)."""
+        return str(self.raw.get("device_id", ""))
+
+    @property
     def device_endpoint(self) -> str:
         return str(self.raw.get("device_endpoint", ""))
 
@@ -175,10 +186,30 @@ class Status:
 class Client:
     """Scripts a running fakeprint's ``/v1/*`` routes. Loopback by default; pass ``base_url``."""
 
-    def __init__(self, base_url: str = DEFAULT_BASE_URL, *, timeout: float = 10.0, http: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str = DEFAULT_BASE_URL,
+        *,
+        timeout: float = 10.0,
+        http: httpx.Client | None = None,
+        device: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.device = device or None
         self._own = http is None
         self._http = http or httpx.Client(base_url=self.base_url, timeout=timeout)
+
+    @property
+    def prefix(self) -> str:
+        """``/d/<id>`` for a client scoped to one device of a multi-device server, else ``""``."""
+        return f"/d/{self.device}" if self.device else ""
+
+    def _scoped(self, path: str) -> str:
+        # Only the control plane (/v1/*) is per device; /health and the manager routes
+        # (/v1/devices, /v1/queue, ...) are server-wide.
+        if self.device and path.startswith("/v1/") and not _SERVER_WIDE.match(path):
+            return self.prefix + path
+        return path
 
     def close(self) -> None:
         if self._own:
@@ -191,6 +222,7 @@ class Client:
         self.close()
 
     def _req(self, method: str, path: str, **kw: Any) -> httpx.Response:
+        path = self._scoped(path)
         r = self._http.request(method, path, **kw)
         if r.status_code >= 400:
             raise ApiError(f"{method} {path}: {r.status_code} {r.text.strip()[:300]}", request=r.request, response=r)
@@ -212,7 +244,7 @@ class Client:
 
     def job(self, job_id: int) -> Job | None:
         """``GET /v1/jobs/{id}``; None when the printer does not know the job."""
-        r = self._http.get(f"/v1/jobs/{job_id}")
+        r = self._http.get(self._scoped(f"/v1/jobs/{job_id}"))
         if r.status_code == 404:
             return None
         if r.status_code >= 400:
@@ -269,8 +301,27 @@ class Client:
             return self._req("GET", "/v1/timing").json()
         return self._req("POST", "/v1/timing", json=patch).json()
 
+    def levels(
+        self, consumables: dict[str, int] | None = None, inputs: dict[str, int] | None = None
+    ) -> dict[str, Any]:
+        """``POST /d/{id}/v1/levels`` ``{consumables: {"Black": 15}, inputs: {"Tray1": 0}}``: runtime
+        levels, never a capability change. Returns the ``live`` block."""
+        body: dict[str, Any] = {}
+        if consumables:
+            body["consumables"] = dict(consumables)
+        if inputs:
+            body["inputs"] = dict(inputs)
+        return self._req("POST", "/v1/levels", json=body).json()
+
+    def devices(self) -> list[dict[str, Any]]:
+        """``GET /v1/devices``: one ``DeviceInfo`` object per printer (docs/multi-device.md 2.2)."""
+        return list(self._req("GET", "/v1/devices").json())
+
     def ctl(self, cmd: str, **args: Any) -> dict[str, Any]:
-        """``POST /v1/ctl`` (status, health, jobs, reset, profile, faults)."""
+        """``POST /v1/ctl`` (status, health, jobs, reset, profile, faults, ...). A client scoped to a
+        device sends ``args.device`` so the daemon runs the command on that printer."""
+        if self.device and "device" not in args:
+            args["device"] = self.device
         return self._req("POST", "/v1/ctl", json={"cmd": cmd, "args": args}).json()
 
     def ctl_info(self) -> dict[str, Any]:

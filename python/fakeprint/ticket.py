@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+import re
 from xml.sax.saxutils import escape
 
 PRINT_NS = "http://schemas.microsoft.com/windows/2006/08/wdp/print"
@@ -31,8 +32,12 @@ HONORABLE = (
 )
 
 
+# XML 1.0 cannot carry these characters, not even as references; strip them (the pdfcraft client does the same).
+_ILLEGAL_XML = re.compile("[" + "".join(map(chr, [*range(0, 9), 11, 12, *range(14, 32), 0xFFFE, 0xFFFF])) + "]")
+
+
 def _txt(v: object) -> str:
-    return escape(str(v))
+    return escape(_ILLEGAL_XML.sub("", str(v)))
 
 
 @dataclass

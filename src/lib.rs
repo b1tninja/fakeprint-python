@@ -6,7 +6,10 @@
 //! WS-Discovery, JetDirect :9100, the Windows named pipe and the instance lock are never started.
 //!
 //! The binding adds no routes and no handlers. The control plane is reached in-process by driving
-//! the library's own `router()` (see `control`), so the JSON is exactly what `/v1/*` serves.
+//! the library's own `ServerHandle::router()` (the manager router: `/v1/devices`, `/d/{id}/...` and the
+//! legacy default-device aliases; see `control`), so the JSON is exactly what `/v1/*` serves.
+//! Several printers are one `ServerConfig::with_devices(..)`; the per-printer calls take an
+//! optional `device` id (default: the first device).
 //! Fault injection and runtime timing are the library's own server-side rules (`/v1/faults`
 //! `inject`, `/v1/timing`), reached through `control`; the Python layer only shapes the JSON.
 
@@ -19,8 +22,9 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Method, Request};
 use axum::Router;
+use fakeprint::manager::DeviceManager;
 use fakeprint::profile::PrinterProfile;
-use fakeprint::server::{router, serve, RouterOptions, ServerConfig};
+use fakeprint::server::{serve, DeviceConfig, ServerConfig};
 use fakeprint::wsd::jobs::CancelSource;
 use fakeprint::wsd::validate::ReplyValidator;
 use fakeprint::wsd::SharedWorld;
@@ -42,12 +46,17 @@ struct Ready {
     device_uuid: Uuid,
     ipp_uuid: Uuid,
     inbox: PathBuf,
+    /// The directory this binding created (the parent of every device inbox) or was given.
+    inbox_root: PathBuf,
+    manager: Arc<DeviceManager>,
+    router: Router,
+    /// `(id, uuid, ipp_uuid, profile, friendly_name, inbox_dir)` per device at start-up.
+    devices: Vec<(String, String, String, String, String, String)>,
 }
 
 #[pyclass(module = "fakeprint")]
 struct Server {
     ready: Ready,
-    control: Router,
     own_inbox: bool,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     thread: Mutex<Option<JoinHandle<anyhow::Result<()>>>>,
@@ -59,6 +68,27 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn rt_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+/// One device description from Python: `(id, profile, uuid_or_None, friendly_name_or_None)`.
+type DeviceSpec = (String, String, Option<String>, Option<String>);
+
+fn device_configs(specs: Vec<DeviceSpec>) -> PyResult<Vec<DeviceConfig>> {
+    specs
+        .into_iter()
+        .map(|(id, profile, uuid, name)| {
+            let mut dc = match uuid {
+                Some(u) => {
+                    let u = Uuid::parse_str(&u)
+                        .map_err(|e| PyValueError::new_err(format!("device {id:?} uuid: {e}")))?;
+                    DeviceConfig::new(id, profile, u)
+                }
+                None => DeviceConfig::derived(id, profile),
+            };
+            dc.friendly_name = name;
+            Ok(dc)
+        })
+        .collect()
 }
 
 fn get_u64(d: &Bound<'_, PyDict>, k: &str) -> PyResult<Option<u64>> {
@@ -148,11 +178,34 @@ fn apply_timing(cfg: &mut ServerConfig, d: &Bound<'_, PyDict>) -> PyResult<()> {
     Ok(())
 }
 
+impl Server {
+    /// The world of `device` (default: the first device). `KeyError` for an unknown id.
+    fn world(&self, device: Option<&str>) -> PyResult<SharedWorld> {
+        match device {
+            None => Ok(Arc::clone(&self.ready.world)),
+            Some(id) => self
+                .ready
+                .manager
+                .world_of(id)
+                .ok_or_else(|| PyKeyError::new_err(format!("unknown device {id:?}"))),
+        }
+    }
+
+    fn validator(&self, device: Option<&str>) -> PyResult<Arc<ReplyValidator>> {
+        match device {
+            None => Ok(Arc::clone(&self.ready.validator)),
+            Some(_) => Ok(Arc::clone(
+                &self.world(device)?.blocking_read().print_ctx().validator,
+            )),
+        }
+    }
+}
+
 #[pymethods]
 impl Server {
     /// Start the server and return once it is listening (loopback only).
     #[new]
-    #[pyo3(signature = (*, profiles=None, profile="generic-wsd", host="127.0.0.1", port=0, device_uuid=None, ipp_uuid=None, inbox=None, name=None, wsd=true, ipp=true, validate_replies=true, limits=None, timing=None, initial_events=false, event_rate_secs=None, tick_ms=None))]
+    #[pyo3(signature = (*, profiles=None, profile="generic-wsd", host="127.0.0.1", port=0, device_uuid=None, ipp_uuid=None, inbox=None, name=None, wsd=true, ipp=true, validate_replies=true, limits=None, timing=None, initial_events=false, event_rate_secs=None, tick_ms=None, devices=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -172,6 +225,7 @@ impl Server {
         initial_events: bool,
         event_rate_secs: Option<u32>,
         tick_ms: Option<u64>,
+        devices: Option<Vec<DeviceSpec>>,
     ) -> PyResult<Self> {
         let ip: IpAddr = host
             .parse()
@@ -186,10 +240,14 @@ impl Server {
                 .transpose()
         };
         let own_inbox = inbox.is_none();
-        let inbox = inbox
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("fakeprint-embedded-{}", Uuid::new_v4())));
+        let inbox = inbox.unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("fakeprint-embedded-{}", Uuid::new_v4()))
+        });
 
         let mut cfg = ServerConfig::embedded(inbox.clone());
+        if let Some(specs) = devices.filter(|d| !d.is_empty()) {
+            cfg = cfg.with_devices(device_configs(specs)?);
+        }
         cfg.listen = SocketAddr::new(ip, port);
         cfg.profile_dir = profiles;
         cfg.profile_name = profile.to_string();
@@ -215,6 +273,7 @@ impl Server {
             apply_timing(&mut cfg, &d)?;
         }
 
+        let root_inbox = inbox.clone();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<Ready, String>>();
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -233,6 +292,21 @@ impl Server {
                             return Err(anyhow::anyhow!(msg));
                         }
                     };
+                    let devices = handle
+                        .devices()
+                        .await
+                        .into_iter()
+                        .map(|d| {
+                            (
+                                d.id,
+                                d.uuid.to_string(),
+                                d.ipp_uuid.to_string(),
+                                d.profile,
+                                d.friendly_name,
+                                d.inbox_dir,
+                            )
+                        })
+                        .collect();
                     let _ = ready_tx.send(Ok(Ready {
                         addr: handle.local_addr(),
                         base_url: handle.base_url().to_string(),
@@ -243,6 +317,10 @@ impl Server {
                         device_uuid: handle.device_uuid(),
                         ipp_uuid: handle.ipp_uuid(),
                         inbox: handle.inbox_dir().to_path_buf(),
+                        inbox_root: root_inbox,
+                        manager: handle.manager(),
+                        router: handle.router(),
+                        devices,
                     }));
                     let _ = stop_rx.await;
                     handle.shutdown().await;
@@ -252,25 +330,12 @@ impl Server {
             .map_err(|e| rt_err(format!("could not start the server thread: {e}")))?;
 
         match py.allow_threads(|| ready_rx.blocking_recv()) {
-            Ok(Ok(ready)) => {
-                // The library's own routes, for the in-process control calls (no WSD/IPP needed).
-                let control = router(
-                    Arc::clone(&ready.world),
-                    &RouterOptions {
-                        wsd: false,
-                        ipp: false,
-                        directed_discovery: None,
-                        trace: false,
-                    },
-                );
-                Ok(Self {
-                    ready,
-                    control,
-                    own_inbox,
-                    stop: Mutex::new(Some(stop_tx)),
-                    thread: Mutex::new(Some(thread)),
-                })
-            }
+            Ok(Ok(ready)) => Ok(Self {
+                ready,
+                own_inbox,
+                stop: Mutex::new(Some(stop_tx)),
+                thread: Mutex::new(Some(thread)),
+            }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 if own_inbox {
@@ -284,7 +349,9 @@ impl Server {
                     Ok(Ok(())) => "exited before listening".to_string(),
                     Err(_) => "panicked while starting".to_string(),
                 };
-                Err(rt_err(format!("fakeprint server failed to start: {reason}")))
+                Err(rt_err(format!(
+                    "fakeprint server failed to start: {reason}"
+                )))
             }
         }
     }
@@ -324,38 +391,63 @@ impl Server {
         self.ready.inbox.display().to_string()
     }
 
+    /// Every device at start-up: `(id, uuid, ipp_uuid, profile, friendly_name, inbox_dir)`, the
+    /// first one being the default device. Later changes: `GET /v1/devices`.
     #[getter]
-    fn running(&self) -> bool {
-        lock(&self.thread).as_ref().is_some_and(|t| !t.is_finished())
+    fn devices(&self) -> Vec<(String, String, String, String, String, String)> {
+        self.ready.devices.clone()
     }
 
-    /// `GET /v1/status` as JSON text.
-    fn status_json(&self) -> PyResult<String> {
-        let st = self.ready.world.blocking_read().status();
+    #[getter]
+    fn running(&self) -> bool {
+        lock(&self.thread)
+            .as_ref()
+            .is_some_and(|t| !t.is_finished())
+    }
+
+    /// `GET /v1/status` as JSON text (of `device`, default the first device).
+    #[pyo3(signature = (device=None))]
+    fn status_json(&self, device: Option<&str>) -> PyResult<String> {
+        let st = self.world(device)?.blocking_read().status();
         serde_json::to_string(&st).map_err(rt_err)
     }
 
     /// Captured documents (the `jobs` rows of `/v1/jobs`) as JSON text.
-    fn captured_json(&self) -> PyResult<String> {
-        let w = self.ready.world.blocking_read();
+    #[pyo3(signature = (device=None))]
+    fn captured_json(&self, device: Option<&str>) -> PyResult<String> {
+        let w = self.world(device)?;
+        let w = w.blocking_read();
         serde_json::to_string(&w.captured()).map_err(rt_err)
     }
 
     /// The `print_jobs` rows of `/v1/jobs` (active and history, ascending by id) as JSON text.
-    fn print_jobs_json(&self, py: Python<'_>) -> PyResult<String> {
-        let (status, body) = self.control(py, "GET", "/v1/jobs", None)?;
+    #[pyo3(signature = (device=None))]
+    fn print_jobs_json(&self, py: Python<'_>, device: Option<&str>) -> PyResult<String> {
+        let path = match device {
+            Some(id) => format!("/d/{id}/v1/jobs"),
+            None => "/v1/jobs".to_string(),
+        };
+        let (status, body) = self.control(py, "GET", &path, None)?;
         if status != 200 {
             return Err(rt_err(format!("GET /v1/jobs: {status} {body}")));
         }
         let v: serde_json::Value = serde_json::from_str(&body).map_err(rt_err)?;
-        serde_json::to_string(v.get("print_jobs").unwrap_or(&serde_json::Value::Null)).map_err(rt_err)
+        serde_json::to_string(v.get("print_jobs").unwrap_or(&serde_json::Value::Null))
+            .map_err(rt_err)
     }
 
     /// Call one of the library's control routes in-process: `(http_status, body_text)`.
     /// `body` is JSON text for POST/DELETE. Same handlers as `/v1/*` over HTTP.
     #[pyo3(signature = (method, path, body=None))]
-    fn control(&self, py: Python<'_>, method: &str, path: &str, body: Option<&str>) -> PyResult<(u16, String)> {
-        let method = Method::from_bytes(method.as_bytes()).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    fn control(
+        &self,
+        py: Python<'_>,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> PyResult<(u16, String)> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let mut rb = Request::builder().method(method).uri(path);
         let body = match body {
             Some(b) => {
@@ -364,8 +456,10 @@ impl Server {
             }
             None => Body::empty(),
         };
-        let req = rb.body(body).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let app = self.control.clone();
+        let req = rb
+            .body(body)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let app = self.ready.router.clone();
         py.allow_threads(move || -> PyResult<(u16, String)> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -383,18 +477,27 @@ impl Server {
     }
 
     /// Schema violations found in outgoing messages (newest 64).
-    fn validation_problems(&self) -> Vec<String> {
-        self.ready.validator.recent_problems()
+    #[pyo3(signature = (device=None))]
+    fn validation_problems(&self, device: Option<&str>) -> PyResult<Vec<String>> {
+        Ok(self.validator(device)?.recent_problems())
     }
 
-    fn validation_problem_count(&self) -> u64 {
-        self.ready.validator.problem_count()
+    #[pyo3(signature = (device=None))]
+    fn validation_problem_count(&self, device: Option<&str>) -> PyResult<u64> {
+        Ok(self.validator(device)?.problem_count())
     }
 
     /// Bytes of every document captured for `job_id`, in document order.
-    fn documents<'py>(&self, py: Python<'py>, job_id: u32) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    #[pyo3(signature = (job_id, device=None))]
+    fn documents<'py>(
+        &self,
+        py: Python<'py>,
+        job_id: u32,
+        device: Option<&str>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let world = self.world(device)?;
         let mut rows: Vec<(u32, String)> = {
-            let w = self.ready.world.blocking_read();
+            let w = world.blocking_read();
             w.captured()
                 .iter()
                 .filter(|c| c.job_id == job_id)
@@ -403,7 +506,11 @@ impl Server {
         };
         rows.sort_by_key(|r| r.0);
         rows.iter()
-            .map(|(_, p)| std::fs::read(p).map(|b| PyBytes::new(py, &b)).map_err(rt_err))
+            .map(|(_, p)| {
+                std::fs::read(p)
+                    .map(|b| PyBytes::new(py, &b))
+                    .map_err(rt_err)
+            })
             .collect()
     }
 
@@ -412,35 +519,40 @@ impl Server {
     /// Goes through the job engine with `CancelSource::Device` (reason `JobCanceledAtDevice`;
     /// `World::cancel_job` is the remote-user source), then drops the job's captured files like
     /// any successful cancel.
-    fn device_cancel(&self, job_id: u32) -> bool {
-        let ctx = self.ready.world.blocking_read().print_ctx();
+    #[pyo3(signature = (job_id, device=None))]
+    fn device_cancel(&self, job_id: u32, device: Option<&str>) -> PyResult<bool> {
+        let ctx = self.world(device)?.blocking_read().print_ctx();
         let ok = ctx.engine.cancel(job_id, CancelSource::Device).is_ok();
         if ok {
             if let Some(inbox) = ctx.inbox.as_ref() {
                 inbox.discard_job(job_id);
             }
         }
-        ok
+        Ok(ok)
     }
 
     /// Forget jobs, captures, counters and conditions (inbox files stay).
-    fn reset(&self) {
-        self.ready.world.blocking_write().reset();
+    #[pyo3(signature = (device=None))]
+    fn reset(&self, device: Option<&str>) -> PyResult<()> {
+        self.world(device)?.blocking_write().reset();
+        Ok(())
     }
 
     /// Hot-swap the profile by id (from the profiles directory).
-    fn set_profile(&self, id: &str) -> PyResult<()> {
-        self.ready
-            .world
+    #[pyo3(signature = (id, device=None))]
+    fn set_profile(&self, id: &str, device: Option<&str>) -> PyResult<()> {
+        self.world(device)?
             .blocking_write()
             .hot_swap_profile(id)
             .map_err(|e| PyKeyError::new_err(format!("{e:#}")))
     }
 
     /// Install a schema-2 profile document (JSON text) directly.
-    fn set_profile_json(&self, doc: &str) -> PyResult<()> {
-        let p = PrinterProfile::from_json(doc).map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
-        self.ready.world.blocking_write().swap_profile(p);
+    #[pyo3(signature = (doc, device=None))]
+    fn set_profile_json(&self, doc: &str, device: Option<&str>) -> PyResult<()> {
+        let p =
+            PrinterProfile::from_json(doc).map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+        self.world(device)?.blocking_write().swap_profile(p);
         Ok(())
     }
 
@@ -454,12 +566,14 @@ impl Server {
         if let Some(thread) = thread {
             res = match py.allow_threads(|| thread.join()) {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(rt_err(format!("fakeprint server stopped with an error: {e:#}"))),
+                Ok(Err(e)) => Err(rt_err(format!(
+                    "fakeprint server stopped with an error: {e:#}"
+                ))),
                 Err(_) => Err(rt_err("fakeprint server thread panicked")),
             };
         }
         if self.own_inbox {
-            let _ = std::fs::remove_dir_all(&self.ready.inbox);
+            let _ = std::fs::remove_dir_all(&self.ready.inbox_root);
         }
         res
     }
@@ -475,7 +589,10 @@ impl Server {
     }
 
     fn __repr__(&self) -> String {
-        format!("Server({}, uuid={})", self.ready.base_url, self.ready.device_uuid)
+        format!(
+            "Server({}, uuid={})",
+            self.ready.base_url, self.ready.device_uuid
+        )
     }
 }
 

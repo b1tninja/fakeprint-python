@@ -18,10 +18,16 @@ classifiers = [
 dependencies = ["httpx>=0.27"]
 
 [project.optional-dependencies]
+# fakeprint.winprint is stdlib-only (ctypes); this extra only names the Windows-only feature.
+windows = []
+mcp = ["mcp>=1.0"]
 dev = ["pytest>=8", "maturin>=1.7,<2"]
 
 [project.scripts]
 fakeprint-refs = "fakeprint.wsd_docs:main"
+fakeprint-ctl = "fakeprint.ctl:main"
+fakeprint-lab = "fakeprint.lab:main"
+fakeprint-mcp = "fakeprint.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/b1tninja/fakeprint-python"
@@ -38,5 +44,6 @@ testpaths = ["tests"]
 pythonpath = ["python"]
 markers = [
   "package: needs the extracted Microsoft WS-Print package (skipped when absent)",
+  "winprint_live: needs FAKEPRINT_WIN_PRINTER (a human-installed printer named fakeprint*); skipped otherwise",
   "embedded: runs the fakeprint server in-process through the native binding",
 ]

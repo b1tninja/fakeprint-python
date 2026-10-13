@@ -24,10 +24,11 @@ from .soap import (
     Subscription,
     parse_fault,
 )
+from .manager import BadRequest, Conflict, Forbidden, Manager, ManagerError, NotYet, PipeTransport, UnknownDevice
 from .ticket import PrintTicket
 
 if TYPE_CHECKING:
-    from .server import Server, start
+    from .server import Device, Server, start
 
 __version__ = "0.1.0"
 
@@ -35,13 +36,22 @@ __all__ = [
     "ActionNotSupported",
     "ApiError",
     "Capture",
+    "BadRequest",
     "Client",
+    "Conflict",
+    "Device",
+    "Forbidden",
     "FormatNotSupported",
     "HttpError",
     "Job",
     "JobDocument",
     "JobIdNotFound",
     "JobStatus",
+    "Manager",
+    "ManagerError",
+    "NotYet",
+    "PipeTransport",
+    "UnknownDevice",
     "JobSummary",
     "NotAcceptingJobs",
     "PrintClient",
@@ -57,13 +67,29 @@ __all__ = [
     "wsd_schema",
     "wsd_docs",
     "services",
+    "registry",
+    "manager",
+    "ui",
+    "tray",
+    "lab",
+    "ctl",
+    "mcp_server",
 ]
 
 
 def __getattr__(name: str) -> Any:
     # Server needs the compiled extension; the pure-Python parts import without it.
-    if name in ("Server", "start"):
+    if name in ("Server", "start", "Device"):
         from . import server
 
         return getattr(server, name)
+    if name in ("registry", "ui", "tray", "lab", "ctl", "mcp_server"):
+        import importlib
+
+        return importlib.import_module(f"fakeprint.{name}")
+    if name == "winprint":
+        # Optional, Windows-only (ctypes over winspool.drv); raises ImportError elsewhere.
+        import importlib
+
+        return importlib.import_module("fakeprint.winprint")
     raise AttributeError(f"module 'fakeprint' has no attribute {name!r}")

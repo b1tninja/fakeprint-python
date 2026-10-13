@@ -97,6 +97,74 @@ srv.set_timing("instant"); srv.timing(processing_base_ms=800); srv.timing()
   private `NotifyTo` targets.
 - The tests that used to be `xfail` while the library caught up all pass; there are none pinned now.
 
+## Windows reference print client (optional, Windows only)
+
+`fakeprint.winprint` drives the Windows spooler (`winspool.drv`, plus GDI for images) through
+`ctypes`, so Windows itself does the WSD/IPP print to a fakeprint printer that a person has already
+added in Windows. Use it as a real-Windows oracle in cross-client tests; fakeprint captures what
+arrives. It is imported lazily: `import fakeprint` works everywhere, and `fakeprint.winprint` raises
+`ImportError` off Windows. `pip install fakeprint[windows]` is only a marker (no extra dependencies).
+
+```python
+from fakeprint import winprint
+winprint.list_printers()                       # read-only: [PrinterInfo(name, port, driver, status)]
+job = winprint.print_raw("fakeprint test", data, doc_name="t", datatype="RAW", user_confirmed=True)
+info = winprint.wait_for_job("fakeprint test", job)   # JobInfo, or None once the spooler purged it
+winprint.print_image("fakeprint test", rgb, 1700, 2200, user_confirmed=True)  # GDI, 1:1 device pixels
+```
+
+Safety, enforced before any spooler call: printing needs an explicit printer name (nothing
+enumerates-and-prints); the name must start with `fakeprint` (case-insensitive) unless the caller
+passes `allow_any_printer=True` **and** the environment has `FAKEPRINT_WIN_ALLOW_ANY=1` (using real
+hardware is the owner's decision; harnesses must never set it); and `user_confirmed=True` is
+required (default `False`). Violations raise `WinPrintRefused`; spooler failures raise
+`WinPrintError(func, code)`. Unit tests (`tests/test_winprint_unit.py`) mock the DLLs and print
+nothing; the one live test runs only when `FAKEPRINT_WIN_PRINTER` names an installed printer starting
+with `fakeprint`. Notes: `print_raw` with datatype `RAW` sends the bytes untouched (the queue/driver
+must accept them); `print_image` uses the default DEVMODE and returns no job id.
+
+## Several printers and the device manager
+
+One embedded server can run N printers behind one port; each has its own profile, UUIDs, endpoints,
+inbox, jobs, faults, timing, levels and injection rules (docs: `fakeprint/docs/multi-device.md`).
+
+```python
+from fakeprint import Server, Device
+with Server(devices=[Device("mono", "mono-laser"), Device("color", "color-inkjet-duplex")]) as srv:
+    d = srv.devices["mono"]                      # the first device is the default one
+    d.uuid; d.ipp_uuid; d.friendly_name; d.profile; d.inbox
+    d.device_endpoint; d.service_endpoint; d.ipp_endpoint     # /d/<id>/... (default: legacy paths)
+    job = d.printer().print_document(pdf, format="application/pdf")   # PrintClient on /d/mono/...
+    d.jobs(); d.documents(job); d.captured(); d.job_ticket(job)
+    d.faults(paper_out=True); d.inject_fault("GetPrinterElements"); d.set_levels(Black=15)
+    d.set_timing("instant"); d.set_profile("generic-wsd"); d.reset(); d.live()
+    srv.devices["color"].client()                # Client scoped to /d/color (faults, timing, levels)
+    srv.add_device(Device("late", "generic-wsd")); srv.remove_device("late")
+    srv.manager                                  # Manager bound to this server (in-memory state)
+Server()                                         # unchanged: one "default" device; srv.printer() etc.
+```
+
+`Server(devices=[...])` is mutually exclusive with `device_uuid`/`ipp_uuid`/`name` (those configure the
+implicit default device). Jobs, faults, levels and injection never leak between devices.
+
+For a running **daemon** (`fakeprint --manage`, default `127.0.0.1:3921`) there are thin clients that
+never write the registry file and never Add anything in Windows:
+
+| Module | What it is |
+|--------|------------|
+| `fakeprint.Manager` | `devices() device() registry() queue() add() remove(forget=) reconfigure() installed() mark_added() forget() reconcile() reconcile_from_windows() levels() advance() skip() reorder() profiles() open_ui() open_settings() wait_installed() status_table() summary_level() guidance()` over HTTP or `Manager.pipe("name")` (named pipe). Typed errors: `BadRequest` 400, `Forbidden` 403, `UnknownDevice` 404, `Conflict` 409, `NotYet` 501 (also a route the build lacks); all are `ApiError`s. |
+| `fakeprint.registry` | read-only `load()/parse()/from_server()` of `%LOCALAPPDATA%\fakeprint\devices.json`, the section 3.4 matching rules (`match_kind`, `match_printers_to_devices`, `reconcile`), capability classes (`capability_class`, `classes`, `select_installed`, `skip_message`) |
+| `fakeprint.ui` | `StatusRow`, `summary_level` (green/amber/red like the tray), `add_guidance`, `format_status_table` |
+| `fakeprint.lab` / `fakeprint-lab` | `ensure up down instructions wait`: register printers, print the ONE "Add now: ... (n of N)" text, walk the queue with a bound per printer; never Adds, never removes an installed printer |
+| `fakeprint.tray` | `ensure_daemon()` attach-first (the tray lives in the daemon), `find_daemon_exe()` |
+| `fakeprint.ctl` / `fakeprint-ctl` | `status devices ui profiles add remove queue levels faults reset open-settings ctl` (`--pipe NAME`) |
+| `fakeprint.mcp_server` / `fakeprint-mcp` | attach-only MCP: devices, queue guidance, device-scoped faults/levels/timing/jobs/captured documents/reset; no tool adds, removes or installs anything |
+
+Harness rule: pick an installed printer by capability class (`registry.select_installed(devices,
+klass)`); when none is installed skip with `registry.skip_message(...)`, which carries the exact Add
+instructions. Windows printers are matched by UUID found in the port string (or the device's exact IPP
+URL), never by name; a TCPMON `host:9100` port or a port naming two UUIDs is foreign.
+
 ## Layout
 
 ```text
@@ -117,8 +185,9 @@ python -m fakeprint.wsd_docs --service scan   # same code, scan package
 
 ## Not done here (compared with fakescan-python)
 
-No `manager`/`registry`/`ctl`/`lab`/`mcp_server` equivalents: fakeprint has a single device per
-process and no multi-device daemon API, device registry CRUD or activity feed yet. The clock is not
-exposed (tests use short real timeouts).
+The activity feed is not exposed and neither is the clock (tests use short real timeouts). Ghost
+clean-up of Windows printer objects is out of scope (deferred in the contract). The daemon-side
+routes (`/v1/queue`, `/v1/registry`, `/v1/reconcile`, ctl `mark_added` ...) belong to the Rust manager
+(M2); against a build without them `Manager` raises `NotYet`.
 
 License: MIT OR Apache-2.0.
