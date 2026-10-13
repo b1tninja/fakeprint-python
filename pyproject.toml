@@ -1,0 +1,42 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fakeprint"
+version = "0.1.0"
+description = "Python bindings for fakeprint: an in-process fake WS-Print printer, control client, SOAP client and schema tooling"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+keywords = ["printer", "wsd", "ws-print", "testing", "fakeprint"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "maturin>=1.7,<2"]
+
+[project.scripts]
+fakeprint-refs = "fakeprint.wsd_docs:main"
+
+[project.urls]
+Homepage = "https://github.com/b1tninja/fakeprint-python"
+Repository = "https://github.com/b1tninja/fakeprint-python"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "fakeprint._native"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Lets `pytest` run straight from a checkout without `pip install -e .`; the native tests need `maturin develop`.
+pythonpath = ["python"]
+markers = [
+  "package: needs the extracted Microsoft WS-Print package (skipped when absent)",
+  "embedded: runs the fakeprint server in-process through the native binding",
+]

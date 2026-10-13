@@ -1,0 +1,53 @@
+/target/
+/dist/
+*.egg-info/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyd
+*.so
+*.dll
+*.pdb
+
+# Mangled or extra cargo target directories (an unquoted Windows path once created one)
+/*target*/
+*.pyd.*
+python/**/_native*.old*
+
+# Secrets, logs, local state, editor and OS cruft
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+devices.json
+*.tmp
+*.orig
+*.rej
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.cursor/
+.claude/
+
+# Microsoft WSD packages and anything derived from them (the license forbids redistribution).
+# Tests that need the real package read it from the sibling fakeprint checkout and skip if absent;
+# generated reference output is written into that checkout's ignored docs/reference/schema/.
+*.zip
+*.ZIP
+*.xsd
+*.XSD
+*.wsdl
+*.WSDL
+*.doc
+*.DOC
+*.docx
+*.DOCX
+/out/
+/generated/
+schema-model.json
