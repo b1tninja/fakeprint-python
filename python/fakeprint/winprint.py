@@ -323,6 +323,8 @@ class PrinterInfo:
     port: str
     driver: str
     status: int
+    #: the printer's Location property (a WSD printer: the device endpoint URL)
+    location: str = ""
 
 
 @dataclass(frozen=True)
@@ -374,9 +376,48 @@ def list_printers() -> list[PrinterInfo]:
             port=arr[i].pPortName or "",
             driver=arr[i].pDriverName or "",
             status=int(arr[i].Status),
+            location=arr[i].pLocation or "",
         )
         for i in range(returned.value)
     ]
+
+
+_WSD_PORTS_KEY = r"SYSTEM\CurrentControlSet\Control\Print\Monitors\WSD Port\Ports"
+
+
+def wsd_port_uuid(port: str, *, _open_key: object | None = None) -> str | None:
+    """The device WSD UUID Windows recorded for a WSD port (read-only registry read).
+
+    Windows names a WSD printer's port ``WSD-<random guid>``; the device UUID is the ``Printer UUID``
+    value of ``HKLM\\SYSTEM\\CurrentControlSet\\Control\\Print\\Monitors\\WSD Port\\Ports\\<port>``.
+    Returns ``None`` for any other port, a missing key or value, or on any error. Never writes.
+    """
+    if not isinstance(port, str) or not port.startswith("WSD-") or any(c in port for c in "\\/"):
+        return None
+    try:
+        if _open_key is None:
+            import winreg  # Windows only
+
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _WSD_PORTS_KEY + "\\" + port, 0, winreg.KEY_READ) as k:
+                value, _kind = winreg.QueryValueEx(k, "Printer UUID")
+        else:
+            value = _open_key(port)  # type: ignore[operator]
+    except (OSError, ImportError):
+        return None
+    return str(value).strip() or None if isinstance(value, str) else None
+
+
+def describe_printers(printers: object | None = None) -> list[dict[str, str]]:
+    """``list_printers()`` as plain dicts for ``Manager.reconcile``: ``name``, ``port``, ``driver``,
+    ``location`` and, for ``WSD-`` ports, ``wsd_uuid`` (see :func:`wsd_port_uuid`). Read-only."""
+    out: list[dict[str, str]] = []
+    for p in (printers if printers is not None else list_printers()):  # type: ignore[union-attr]
+        row = {"name": p.name, "port": p.port, "driver": p.driver, "location": p.location}
+        u = wsd_port_uuid(p.port)
+        if u:
+            row["wsd_uuid"] = u
+        out.append(row)
+    return out
 
 
 def _open(api: object, printer: str) -> wintypes.HANDLE:

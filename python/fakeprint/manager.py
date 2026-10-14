@@ -418,13 +418,15 @@ class Manager:
 
     def reconcile_from_windows(self, list_printers: Callable[[], Iterable[Any]] | None = None) -> ReconcileResult:
         """List Windows printers (read-only) and reconcile. Uses ``fakeprint.winprint.list_printers``
-        when the module provides it, or ``list_printers`` (a callable returning mappings/objects with
-        ``name``/``port``/``driver``). Changes nothing on Windows."""
+        when the module provides it (preferring ``describe_printers``, which adds each printer's
+        ``location`` and, for ``WSD-`` ports, the ``wsd_uuid`` read from the WSD Port registry key), or
+        ``list_printers`` (a callable returning mappings/objects with ``name``/``port``/``driver`` and
+        optionally ``location``/``wsd_uuid``). Changes nothing on Windows."""
         if list_printers is None:
             try:
                 from . import winprint
 
-                list_printers = winprint.list_printers
+                list_printers = getattr(winprint, "describe_printers", None) or winprint.list_printers
             except (ImportError, AttributeError) as e:
                 raise RuntimeError(
                     "fakeprint.winprint.list_printers is not available; pass list_printers=... to reconcile_from_windows"

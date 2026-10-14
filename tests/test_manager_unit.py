@@ -134,6 +134,20 @@ def test_reconcile_from_windows_uses_the_given_lister_read_only():
     assert m.reconcile_from_windows(lambda: [PI()]).installed == ["a"]
 
 
+def test_reconcile_from_windows_passes_wsd_uuid_and_location_through():
+    fake, m = make(device_info("a", 0xA1, default=True))
+    rows = [{"name": "Fake WSD printer", "port": "WSD-3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b", "driver": "d",
+             "wsd_uuid": U1, "location": "http://127.0.0.1:3921/WebServices/Device"}]
+    m.reconcile_from_windows(lambda: rows)
+    sent = fake.calls[-1][2]["printers"][0]
+    assert sent["wsd_uuid"] == U1 and sent["location"].endswith("/WebServices/Device") and sent["port"].startswith("WSD-")
+    # installed(): the local check accepts a random-port printer with the recorded UUID, and sends the fields
+    m.installed("a", rows[0])
+    assert fake.calls[-1][2]["windows"]["wsd_uuid"] == U1
+    with pytest.raises(Exception):
+        m.installed("a", {**rows[0], "wsd_uuid": "11111111-2222-4333-8444-555555555555"})
+
+
 def test_reconcile_from_windows_without_winprint_says_how_to_proceed(monkeypatch):
     import sys
 

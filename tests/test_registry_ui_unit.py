@@ -117,6 +117,46 @@ def test_match_kind(port, expected):
     assert match_kind(dev(), WindowsPrinter(name="fakeprint mono", port=port)) == expected
 
 
+RANDOM_PORT = "WSD-3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b"  # what Windows really names a WSD port
+
+
+@pytest.mark.parametrize(
+    "extra,expected",
+    [
+        ({"wsd_uuid": U1}, "wsd"),                                           # the registry's Printer UUID
+        ({"wsd_uuid": "{" + U1.upper() + "}"}, "wsd"),
+        ({"wsd_uuid": f"urn:uuid:{U1}"}, "wsd"),
+        ({"wsd_uuid": U2}, None),                                            # a different device's UUID
+        ({"wsd_uuid": "11111111-2222-4333-8444-555555555555"}, None),
+        ({"wsd_uuid": U2, "location": "http://127.0.0.1:3921/d/mono/WebServices/Device"}, None),
+        ({"location": "http://127.0.0.1:3921/d/mono/WebServices/Device"}, "wsd"),   # Location = endpoint URL
+        ({"location": "http://127.0.0.1:3921/d/mono/WebServices/Device/"}, "wsd"),
+        ({"location": "http://127.0.0.1:3921/WebServices/Device"}, None),    # the default device's endpoint
+        ({"location": "http://127.0.0.1:9999/d/mono/WebServices/Device"}, None),
+        ({"location": "fakeprint mono"}, None),
+        ({}, None),                                                          # random port alone proves nothing
+    ],
+)
+def test_match_kind_windows_wsd_port_with_random_guid(extra, expected):
+    p = WindowsPrinter(name="fakeprint mono", port=RANDOM_PORT, **extra)
+    assert match_kind(dev(), p) == expected
+
+
+def test_windows_printer_round_trips_the_new_fields():
+    p = WindowsPrinter.parse({"name": "n", "port": RANDOM_PORT, "wsd_uuid": U1, "location": "http://h:3921/WebServices/Device"})
+    assert p.to_dict()["wsd_uuid"] == U1 and p.to_dict()["location"].startswith("http://")
+    assert "wsd_uuid" not in WindowsPrinter(name="n", port="p").to_dict()  # additive: absent when unknown
+
+
+def test_evidence_naming_two_devices_is_foreign_not_first_wins():
+    a, b = dev("mono", 0xA1), dev("color", 0xB1)
+    both = WindowsPrinter(name="x", port=RANDOM_PORT, wsd_uuid=U1, location=b.device_endpoint)
+    m = registry.match_printers_to_devices([a, b], [both])
+    assert m.matched == {} and m.foreign == [both]
+    ok = WindowsPrinter(name="x", port=RANDOM_PORT, wsd_uuid=U1)
+    assert registry.match_printers_to_devices([a, b], [ok]).kinds == {"mono": "wsd"}
+
+
 def test_name_alone_never_matches():
     m = match_printers_to_devices([dev()], [{"name": "fakeprint mono", "port": "LPT1:"}])
     assert not m.matched and [p.name for p in m.foreign] == ["fakeprint mono"]

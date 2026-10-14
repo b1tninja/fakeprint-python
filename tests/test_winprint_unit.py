@@ -87,9 +87,13 @@ class FakeSpool:
             ctypes.set_last_error(wp.ERROR_INSUFFICIENT_BUFFER)
             return 0
         arr = ctypes.cast(buf, ctypes.POINTER(wp.PRINTER_INFO_2W))
-        for i, (n, port, drv, st) in enumerate(self.printers):
+        for i, (n, port, drv, st, *rest) in enumerate(self.printers):
             strs = [ctypes.create_unicode_buffer(x) for x in (n, port, drv)]
             self.keep += strs
+            if rest:
+                loc = ctypes.create_unicode_buffer(rest[0])
+                self.keep.append(loc)
+                arr[i].pLocation = ctypes.cast(loc, wintypes.LPWSTR)
             arr[i].pPrinterName = ctypes.cast(strs[0], wintypes.LPWSTR)
             arr[i].pPortName = ctypes.cast(strs[1], wintypes.LPWSTR)
             arr[i].pDriverName = ctypes.cast(strs[2], wintypes.LPWSTR)
@@ -305,6 +309,42 @@ def test_list_printers_read_only(spool):
     out = wp.list_printers()
     assert out == [wp.PrinterInfo("fakeprint a", "WSD-1", "Drv A", 0), wp.PrinterInfo("Other", "LPT1:", "Drv B", 8)]
     assert set(spool.calls) == {"EnumPrintersW"}
+
+
+def test_list_printers_reports_the_location(spool):
+    spool.printers = [("Fake WSD printer", "WSD-3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b", "Drv", 0, "http://192.168.1.70:3921/WebServices/Device")]
+    (p,) = wp.list_printers()
+    assert p.location == "http://192.168.1.70:3921/WebServices/Device"
+
+
+def test_wsd_port_uuid_reads_only_wsd_ports_and_never_raises():
+    reads = []
+
+    def fake(port):
+        reads.append(port)
+        return "{00000000-0000-4000-8000-0000000000A1}"
+
+    assert wp.wsd_port_uuid("WSD-3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b", _open_key=fake) == "{00000000-0000-4000-8000-0000000000A1}"
+    for bad in ("192.168.1.5:9100", "USB001", "LPT1:", r"WSD-x\..\y", "WSD-a/b", "", None):
+        assert wp.wsd_port_uuid(bad, _open_key=fake) is None
+    assert reads == ["WSD-3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b"]  # nothing else was even looked up
+
+    def missing(port):
+        raise FileNotFoundError(port)
+
+    assert wp.wsd_port_uuid("WSD-abc", _open_key=missing) is None
+    assert wp.wsd_port_uuid("WSD-abc", _open_key=lambda p: 5) is None  # not a string value
+
+
+def test_describe_printers_adds_location_and_wsd_uuid(monkeypatch):
+    monkeypatch.setattr(wp, "wsd_port_uuid", lambda port: "00000000-0000-4000-8000-0000000000a1" if port.startswith("WSD-") else None)
+    rows = wp.describe_printers([
+        wp.PrinterInfo("Fake WSD printer", "WSD-abc", "Drv", 0, "http://h:3921/WebServices/Device"),
+        wp.PrinterInfo("Brother", "192.168.1.5:9100", "Drv", 0),
+    ])
+    assert rows[0] == {"name": "Fake WSD printer", "port": "WSD-abc", "driver": "Drv",
+                       "location": "http://h:3921/WebServices/Device", "wsd_uuid": "00000000-0000-4000-8000-0000000000a1"}
+    assert "wsd_uuid" not in rows[1]
 
 
 def test_list_printers_empty_and_error(spool):

@@ -7,10 +7,13 @@ Python NEVER writes the registry file. Every mutation goes through the daemon
   concurrent atomic rewrite); :func:`parse` takes a decoded document; :func:`from_server` asks a
   daemon (``GET /v1/registry``).
 * :func:`match_printers_to_devices` is the contract's rule (docs/multi-device.md 3.4): a Windows
-  printer belongs to a device only when (a) its port string holds exactly one distinct UUID and it is the
-  device's WSD UUID (``kind="wsd"``), or (b) its port is an ``http(s)``/``ipp(s)`` URL on the device's
-  own authority and exactly its IPP path (``kind="ipp"``). Everything else (a TCPMON ``host:9100``
-  port, names that merely look alike, two UUIDs in a port, an unknown UUID) is *foreign*.
+  printer belongs to a device only when (a) the UUID Windows recorded for its WSD port (``wsd_uuid``,
+  the ``Printer UUID`` value of the port's registry key; Windows names the port ``WSD-<random guid>``),
+  or the one UUID in the port string, or its ``location`` (the device endpoint URL) is that device
+  (``kind="wsd"``), or (b) its port is an ``http(s)``/``ipp(s)`` URL on the device's own authority
+  and exactly its IPP path (``kind="ipp"``). All evidence must agree. Everything else (a TCPMON
+  ``host:9100`` port, names that merely look alike, two UUIDs in a port, an unknown ``wsd_uuid``)
+  is *foreign*.
 * :func:`reconcile` applies that rule to a listing without changing anything.
 * :func:`capability_class` and :func:`select_installed` are the harness helpers: pick "an installed
   printer of this shape" by the 12-hex-digit class of the published capability fingerprint.
@@ -78,11 +81,15 @@ class WindowsPrinter:
     port: str = ""
     driver: str = ""
     id: str = ""
+    #: the printer's Location property (for a WSD printer: the device endpoint URL)
+    location: str = ""
+    #: the device WSD UUID Windows recorded for the port (``Printer UUID`` registry value)
+    wsd_uuid: str = ""
 
     @classmethod
     def parse(cls, raw: Any) -> WindowsPrinter:
-        """From a mapping (``name``/``port``/``driver``/``id``) or any object with those attributes
-        (for example :class:`fakeprint.winprint.PrinterInfo`)."""
+        """From a mapping (``name``/``port``/``driver``/``id``/``location``/``wsd_uuid``) or any
+        object with those attributes (for example :class:`fakeprint.winprint.PrinterInfo`)."""
         if isinstance(raw, WindowsPrinter):
             return raw
         get = raw.get if isinstance(raw, Mapping) else (lambda k, d=None: getattr(raw, k, d))
@@ -91,10 +98,17 @@ class WindowsPrinter:
             port=str(get("port") or ""),
             driver=str(get("driver") or ""),
             id=str(get("id") or ""),
+            location=str(get("location") or ""),
+            wsd_uuid=str(get("wsd_uuid") or ""),
         )
 
     def to_dict(self) -> dict[str, str]:
-        return {"name": self.name, "port": self.port, "driver": self.driver, "id": self.id}
+        d = {"name": self.name, "port": self.port, "driver": self.driver, "id": self.id}
+        if self.location:
+            d["location"] = self.location
+        if self.wsd_uuid:
+            d["wsd_uuid"] = self.wsd_uuid
+        return d
 
 
 @dataclass
@@ -502,7 +516,21 @@ def match_kind(dev: Any, printer: WindowsPrinter | Mapping[str, Any]) -> str | N
     p = WindowsPrinter.parse(printer)
     uid = _norm_uuid(_dev_attr(dev, "uuid", "device_uuid"))
     found = port_uuids(p.port)
-    if uid and len(found) == 1 and next(iter(found)) == uid:
+    if len(found) > 1:
+        return None
+    wsd = _norm_uuid(p.wsd_uuid) if p.wsd_uuid.strip() else ""
+    if wsd and wsd != uid:
+        return None  # it records a different WSD UUID: not this device
+    loc = _authority(p.location)
+    dev_ep = _dev_attr(dev, "device_endpoint")
+    loc_ok = bool(
+        loc
+        and dev_ep
+        and loc == _authority(dev_ep)
+        and _url_path(p.location).rstrip("/").lower() == _url_path(dev_ep).rstrip("/").lower()
+    )
+    port_ok = bool(uid and found and next(iter(found)) == uid)
+    if uid and (wsd or port_ok or loc_ok):
         return "wsd"
     ipp = _dev_attr(dev, "ipp_endpoint")
     if ipp and not found:
@@ -510,6 +538,22 @@ def match_kind(dev: Any, printer: WindowsPrinter | Mapping[str, Any]) -> str | N
         if a and b and a == b and _url_path(p.port) == _url_path(ipp):
             return "ipp"
     return None
+
+
+def _points_at(dev: Any, p: WindowsPrinter) -> bool:
+    """Does any single piece of WSD evidence (recorded UUID, the port's UUID, Location) name ``dev``?"""
+    uid = _norm_uuid(_dev_attr(dev, "uuid", "device_uuid"))
+    if not uid:
+        return False
+    if p.wsd_uuid.strip() and _norm_uuid(p.wsd_uuid) == uid:
+        return True
+    if uid in port_uuids(p.port):
+        return True
+    loc, ep = _authority(p.location), _dev_attr(dev, "device_endpoint")
+    return bool(
+        loc and ep and loc == _authority(ep)
+        and _url_path(p.location).rstrip("/").lower() == _url_path(ep).rstrip("/").lower()
+    )
 
 
 @dataclass
@@ -531,12 +575,11 @@ def match_printers_to_devices(
     out = PrinterMatch()
     for raw in printers:
         p = WindowsPrinter.parse(raw)
-        hit: tuple[str, str] | None = None
-        for d in devs:
-            kind = match_kind(d, p)
-            if kind:
-                hit = (_dev_attr(d, "id", "name"), kind)
-                break
+        # evidence that names two different devices (even when one of them is then vetoed by the
+        # printer's own recorded UUID) is ambiguous: foreign
+        named = [d for d in devs if match_kind(d, p) or _points_at(d, p)]
+        k = match_kind(named[0], p) if len(named) == 1 else None
+        hit = (_dev_attr(named[0], "id", "name"), k) if k else None
         if hit is None:
             out.foreign.append(p)
         elif hit[0] in out.matched:
