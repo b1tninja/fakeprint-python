@@ -168,8 +168,26 @@ class FakeGdi:
         return self._r("StretchDIBits")
 
 
+FAKE_U = fakeprint.FAKE_UUID_PREFIX + "0000000000f3" if sys.platform == "win32" else ""
+FOREIGN_U = "3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b"  # a made-up UUID outside the fake namespace
+
+
+def _fake_resolver(monkeypatch, table=None):
+    """Replace the (registry-backed) printer -> WSD UUID lookup; labels like "fakeprint a" are just
+    test names that map to a fake UUID, everything else is unknown (None)."""
+    table = table or {}
+
+    def resolve(name):
+        if name in table:
+            return table[name]
+        return FAKE_U if isinstance(name, str) and name.lower().startswith("fakeprint") else None
+
+    monkeypatch.setattr(wp, "_resolve_printer_uuid", resolve)
+
+
 @pytest.fixture
 def spool(monkeypatch):
+    _fake_resolver(monkeypatch)
     fake = FakeSpool()
     monkeypatch.setattr(wp, "_winspool", fake)
     monkeypatch.delenv(wp.ALLOW_ANY_ENV, raising=False)
@@ -179,6 +197,7 @@ def spool(monkeypatch):
 @pytest.fixture
 def gdi(monkeypatch):
     fake = FakeGdi()
+    _fake_resolver(monkeypatch)
     monkeypatch.setattr(wp, "_gdi", fake)
     monkeypatch.delenv(wp.ALLOW_ANY_ENV, raising=False)
     return fake
@@ -191,6 +210,7 @@ def tripwire(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("a real DLL was loaded")
 
+    _fake_resolver(monkeypatch)
     monkeypatch.setattr(wp, "_winspool", None)
     monkeypatch.setattr(wp, "_gdi", None)
     monkeypatch.setattr(wp.ctypes, "WinDLL", boom)
@@ -237,11 +257,49 @@ def test_refuses_missing_or_non_string_name(tripwire, name):
 
 
 @pytest.mark.parametrize("name", ["HP LaserJet", "Microsoft Print to PDF", "my fakeprint", " fakeprint"])
-def test_refuses_non_fakeprint_names(tripwire, name):
-    with pytest.raises(wp.WinPrintRefused, match="fakeprint"):
+def test_refuses_printers_without_wsd_uuid(tripwire, name):
+    # not installed / no WSD port => lookup yields None => refused, whatever the name looks like
+    with pytest.raises(wp.WinPrintRefused, match="not a fake device"):
         wp.print_raw(name, b"x", user_confirmed=True)
     with pytest.raises(wp.WinPrintRefused):
         wp.print_image(name, b"\0\0\0", 1, 1, user_confirmed=True)
+
+
+def test_name_alone_proves_nothing(tripwire, monkeypatch):
+    # a printer NAMED fakeprint but whose WSD UUID is foreign (or has no WSD port) is refused
+    for u in (FOREIGN_U, None, "", FAKE_U[:-1]):
+        _fake_resolver(monkeypatch, {"fakeprint real": u})
+        with pytest.raises(wp.WinPrintRefused, match="UUID"):
+            wp.print_raw("fakeprint real", b"x", user_confirmed=True)
+
+
+def test_any_name_is_fine_when_uuid_is_fake(spool, monkeypatch):
+    _fake_resolver(monkeypatch, {"Whatever it is called": FAKE_U.upper()})
+    assert wp.print_raw("Whatever it is called", b"abc", user_confirmed=True) == 77
+    assert spool.opened == ["Whatever it is called"]
+
+
+def test_resolver_uses_port_registry_lookup(monkeypatch):
+    monkeypatch.setattr(wp, "list_printers", lambda: [
+        wp.PrinterInfo("Mine", "WSD-aaaa", "d", 0), wp.PrinterInfo("Usb", "USB001", "d", 0),
+        wp.PrinterInfo("Ipp", "http://h/ipp/print", "d", 0)])
+    seen = []
+    monkeypatch.setattr(wp, "wsd_port_uuid", lambda port: seen.append(port) or (FAKE_U if port == "WSD-aaaa" else None))
+    assert wp._resolve_printer_uuid("Mine") == FAKE_U
+    assert wp._resolve_printer_uuid("Usb") is None and wp._resolve_printer_uuid("Ipp") is None
+    assert wp._resolve_printer_uuid("mine") is None and wp._resolve_printer_uuid("Missing") is None
+    monkeypatch.setattr(wp, "list_printers", lambda: (_ for _ in ()).throw(wp.WinPrintError("EnumPrintersW", 5)))
+    assert wp._resolve_printer_uuid("Mine") is None
+
+
+def test_is_fake_uuid_forms():
+    f = fakeprint.is_fake_uuid
+    base = "00000000-0000-4000-8000-0000000000f3"
+    assert fakeprint.FAKE_UUID_PREFIX == "00000000-0000-4000-8000-"
+    for v in (base, base.upper(), "{" + base + "}", "urn:uuid:" + base, "uuid:" + base, " " + base + " "):
+        assert f(v), v
+    for v in (FOREIGN_U, "", None, 5, b"x", "00000000-0000-4000-8000-", "00000000-0000-4000-8001-0000000000f3"):
+        assert not f(v), v
 
 
 def test_allow_any_needs_both_flag_and_env(tripwire, monkeypatch):
@@ -256,14 +314,16 @@ def test_allow_any_needs_both_flag_and_env(tripwire, monkeypatch):
 
 
 def test_allow_any_passes_guard_with_both(monkeypatch, spool):
+    _fake_resolver(monkeypatch, {"Other": None})
     monkeypatch.setenv(wp.ALLOW_ANY_ENV, "1")
     assert wp.print_raw("Other", b"abc", user_confirmed=True, allow_any_printer=True) == 77
     assert spool.opened == ["Other"]
 
 
-def test_prefix_is_case_insensitive(spool):
-    wp.print_raw("FakePrint Lab", b"abc", user_confirmed=True)
-    assert spool.opened == ["FakePrint Lab"]
+def test_uuid_prefix_is_case_insensitive(spool, monkeypatch):
+    _fake_resolver(monkeypatch, {"Lab": FAKE_U.upper()})
+    wp.print_raw("Lab", b"abc", user_confirmed=True)
+    assert spool.opened == ["Lab"]
 
 
 # --- print_raw -------------------------------------------------------------------------------------
@@ -291,6 +351,7 @@ def test_print_raw_empty_payload(spool):
 )
 def test_print_raw_error_mapping_and_cleanup(monkeypatch, func, code):
     fake = FakeSpool(fail=func, err=code)
+    _fake_resolver(monkeypatch)
     monkeypatch.setattr(wp, "_winspool", fake)
     with pytest.raises(wp.WinPrintError) as ei:
         wp.print_raw("fakeprint t", b"abc", user_confirmed=True)
@@ -427,6 +488,7 @@ def test_print_image_validates_size(gdi):
 @pytest.mark.parametrize("func,code", [("CreateDCW", 1801), ("StartDocW", 1722), ("StretchDIBits", 1722)])
 def test_print_image_errors(monkeypatch, func, code):
     fake = FakeGdi(fail=func)
+    _fake_resolver(monkeypatch)
     monkeypatch.setattr(wp, "_gdi", fake)
     with pytest.raises(wp.WinPrintError) as ei:
         wp.print_image("fakeprint t", b"\0\0\0", 1, 1, user_confirmed=True)
@@ -467,14 +529,16 @@ def test_declared_prototypes_are_explicit():
 
 # --- optional live test (a human must have installed a fakeprint* printer) ---------------------------
 
-LIVE = os.environ.get("FAKEPRINT_WIN_PRINTER", "")
+LIVE = os.environ.get("FAKEPRINT_WIN_PRINTER", "")  # the name of an installed printer whose WSD UUID is fake
 
 
 @pytest.mark.winprint_live
-@pytest.mark.skipif(not LIVE.lower().startswith("fakeprint"), reason="FAKEPRINT_WIN_PRINTER is not a fakeprint* printer")
+@pytest.mark.skipif(not LIVE, reason="FAKEPRINT_WIN_PRINTER is not set")
 def test_live_print_to_installed_fakeprint_printer():
     if LIVE not in {p.name for p in wp.list_printers()}:
         pytest.skip(f"printer {LIVE!r} is not installed")
+    if not fakeprint.is_fake_uuid(wp._resolve_printer_uuid(LIVE)):
+        pytest.skip(f"printer {LIVE!r} is not a fake device (WSD UUID outside the fake prefix)")
     job = wp.print_raw(LIVE, b"%!PS\nshowpage\n", doc_name="fakeprint-live", user_confirmed=True)
     info = wp.wait_for_job(LIVE, job, timeout=60)
     assert info is None or not info.failed

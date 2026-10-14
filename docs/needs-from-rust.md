@@ -28,7 +28,8 @@ No real server bug is known at the moment.
 ## Windows oracle (not a Rust need)
 
 `python/fakeprint/winprint.py` is a Python-only optional client over `winspool.drv`; it needs nothing
-from the Rust crate. It requires a human-installed Windows printer named `fakeprint*` pointing at a
+from the Rust crate. It requires a human-installed Windows printer whose WSD device UUID starts with the fake prefix (`00000000-0000-4000-8000-`; names are not
+used) pointing at a
 running fakeprint server (the WSD/IPP add-printer step is manual and was not automated or verified).
 
 ## Multi-device and the manager (WP-P, against docs/multi-device.md in fakeprint)

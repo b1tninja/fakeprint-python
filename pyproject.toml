@@ -44,6 +44,6 @@ testpaths = ["tests"]
 pythonpath = ["python"]
 markers = [
   "package: needs the extracted Microsoft WS-Print package (skipped when absent)",
-  "winprint_live: needs FAKEPRINT_WIN_PRINTER (a human-installed printer named fakeprint*); skipped otherwise",
+  "winprint_live: needs FAKEPRINT_WIN_PRINTER (a human-installed printer whose WSD UUID is in the fake namespace); skipped otherwise",
   "embedded: runs the fakeprint server in-process through the native binding",
 ]

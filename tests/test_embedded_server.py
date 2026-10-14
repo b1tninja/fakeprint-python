@@ -73,7 +73,7 @@ def test_status_identity(srv):
 
 
 def test_explicit_uuid_and_name(server_cls):
-    u = "11111111-2222-4333-8444-555555555555"
+    u = "00000000-0000-4000-8000-555555555555"
     with server_cls(device_uuid=u, name="unit") as s:
         assert s.device_uuid == u
         assert s.status().name == "unit"

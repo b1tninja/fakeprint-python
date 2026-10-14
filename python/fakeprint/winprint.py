@@ -7,9 +7,12 @@ the WSD/IPP print to it, while fakeprint captures what arrives. It is not a gene
 Safety (hard rules, enforced before any spooler call and covered by tests/test_winprint_unit.py):
 
 * printing needs an explicit printer NAME; nothing here enumerates-and-prints;
-* the name must start with ``fakeprint`` (case-insensitive) unless the caller passes
-  ``allow_any_printer=True`` AND the environment has ``FAKEPRINT_WIN_ALLOW_ANY=1``. Using real
-  hardware is the owner's decision; test harnesses must never set that variable;
+* the printer must be one of ours, identified by its WSD device UUID (never by its name): the port
+  must be a ``WSD-`` port whose registry ``Printer UUID`` starts with ``fakeprint.FAKE_UUID_PREFIX``.
+  Any other printer (USB, TCPMON, IPP URL ports, foreign WSD devices, unknown names) is refused
+  unless the caller passes ``allow_any_printer=True`` AND the environment has
+  ``FAKEPRINT_WIN_ALLOW_ANY=1``. Using real hardware is the owner's decision; test harnesses must
+  never set that variable;
 * printing needs ``user_confirmed=True`` (default False), as in ``pdfcraft.wsdprint``;
 * ``list_printers`` / ``job_status`` / ``wait_for_job`` only read.
 
@@ -25,12 +28,13 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
+from . import FAKE_UUID_PREFIX, is_fake_uuid
+
 if sys.platform != "win32":  # pragma: no cover - exercised only off Windows
     raise ImportError("fakeprint.winprint needs Windows (it drives the Windows spooler, winspool.drv)")
 
 __all__ = [
     "ALLOW_ANY_ENV",
-    "REQUIRED_PREFIX",
     "JobInfo",
     "PrinterInfo",
     "WinPrintError",
@@ -42,7 +46,6 @@ __all__ = [
     "wait_for_job",
 ]
 
-REQUIRED_PREFIX = "fakeprint"
 ALLOW_ANY_ENV = "FAKEPRINT_WIN_ALLOW_ANY"
 
 PRINTER_ENUM_LOCAL = 0x2
@@ -304,14 +307,27 @@ def _check_print_allowed(printer: object, user_confirmed: bool, allow_any_printe
         raise WinPrintRefused("printing needs user_confirmed=True (the person must have agreed to this print)")
     if not isinstance(printer, str) or not printer.strip():
         raise WinPrintRefused("printing needs an explicit printer name (no default printer, no enumeration)")
-    if printer.lower().startswith(REQUIRED_PREFIX):
-        return printer
     if allow_any_printer is True and os.environ.get(ALLOW_ANY_ENV) == "1":
         return printer
+    if is_fake_uuid(_resolve_printer_uuid(printer)):
+        return printer
     raise WinPrintRefused(
-        f"printer {printer!r} does not start with {REQUIRED_PREFIX!r}; other printers need "
+        f"printer {printer!r} is not a fake device (its WSD device UUID does not start with "
+        f"{FAKE_UUID_PREFIX!r}, or it has no WSD port); other printers need "
         f"allow_any_printer=True and {ALLOW_ANY_ENV}=1 (the owner's decision, never set by a harness)"
     )
+
+
+def _resolve_printer_uuid(printer: str) -> str | None:
+    """The WSD device UUID behind the installed printer called exactly ``printer`` (read-only), or
+    ``None`` (not installed, not a WSD port, or any error)."""
+    try:
+        for p in list_printers():
+            if p.name == printer:
+                return wsd_port_uuid(p.port)
+    except Exception:  # noqa: BLE001 - any failure means "cannot prove it is ours"
+        return None
+    return None
 
 
 # --- data types -----------------------------------------------------------------------------------

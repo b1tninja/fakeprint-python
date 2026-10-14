@@ -114,13 +114,17 @@ winprint.print_image("fakeprint test", rgb, 1700, 2200, user_confirmed=True)  # 
 ```
 
 Safety, enforced before any spooler call: printing needs an explicit printer name (nothing
-enumerates-and-prints); the name must start with `fakeprint` (case-insensitive) unless the caller
-passes `allow_any_printer=True` **and** the environment has `FAKEPRINT_WIN_ALLOW_ANY=1` (using real
-hardware is the owner's decision; harnesses must never set it); and `user_confirmed=True` is
-required (default `False`). Violations raise `WinPrintRefused`; spooler failures raise
-`WinPrintError(func, code)`. Unit tests (`tests/test_winprint_unit.py`) mock the DLLs and print
-nothing; the one live test runs only when `FAKEPRINT_WIN_PRINTER` names an installed printer starting
-with `fakeprint`. Notes: `print_raw` with datatype `RAW` sends the bytes untouched (the queue/driver
+enumerates-and-prints); the printer must be one of ours **by WSD device UUID, never by name**: its
+port must be a `WSD-` port whose registry `Printer UUID` (read-only, `winprint.wsd_port_uuid`) starts
+with `fakeprint.FAKE_UUID_PREFIX` (`00000000-0000-4000-8000-`; test with `fakeprint.is_fake_uuid`,
+which accepts any case, braces and `urn:uuid:`). Non-WSD ports (USB, TCPMON, IPP URL ports), foreign
+WSD devices and unknown names are refused unless the caller passes `allow_any_printer=True` **and**
+the environment has `FAKEPRINT_WIN_ALLOW_ANY=1` (using real hardware is the owner's decision;
+harnesses must never set it); and `user_confirmed=True` is required (default `False`; checked first).
+Violations raise `WinPrintRefused`; spooler failures raise `WinPrintError(func, code)`. Unit tests
+(`tests/test_winprint_unit.py`) mock the DLLs and the registry lookup and print nothing; the one live
+test runs only when `FAKEPRINT_WIN_PRINTER` names an installed printer whose WSD UUID is in the fake
+namespace. Notes: `print_raw` with datatype `RAW` sends the bytes untouched (the queue/driver
 must accept them); `print_image` uses the default DEVMODE and returns no job id.
 
 ## Several printers and the device manager
