@@ -10,11 +10,13 @@ conditions and injection rules) and ``/v1/timing``.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from .requestlog import RequestLogCalls
 
 DEFAULT_BASE_URL = "http://127.0.0.1:3921"
 
@@ -86,6 +88,14 @@ class Job:
     ipp: dict[str, Any] | None = None
     #: Optional test-page analysis summary (``Client.job(id, analysis=True)`` / ``Client.job_analysis``); never filled by the daemon.
     analysis: dict[str, Any] | None = None
+    #: Sequence numbers of this job's records in the device's request log that the ring still holds
+    #: (``GET /v1/requests?job=<id>``).
+    request_seqs: list[int] = field(default_factory=list)
+    #: The ``PrintTicket`` of ``CreatePrintJob`` exactly as received (WS-Print); None for IPP / seeded jobs
+    #: or when the request log was off.
+    ticket_received: str | None = None
+    #: What the ticket validator replaced or dropped: ``[{"field", "requested", "applied", "reason"}]``.
+    ticket_substitutions: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Job:
@@ -100,6 +110,9 @@ class Job:
             media_sheets_completed=int(d.get("media_sheets_completed", 0)),
             last_document_received=bool(d.get("last_document_received", False)),
             ipp=d.get("ipp"),
+            request_seqs=[int(x) for x in d.get("request_seqs", [])],
+            ticket_received=d.get("ticket_received"),
+            ticket_substitutions=list(d.get("ticket_substitutions", [])),
         )
 
     @property
@@ -202,7 +215,7 @@ class Status:
         return {str(k): int(v) for k, v in (self.raw.get("ipp_actions") or {}).items()}
 
 
-class Client:
+class Client(RequestLogCalls):
     """Scripts a running fakeprint's ``/v1/*`` routes. Loopback by default; pass ``base_url``."""
 
     def __init__(
@@ -246,6 +259,29 @@ class Client:
         if r.status_code >= 400:
             raise ApiError(f"{method} {path}: {r.status_code} {r.text.strip()[:300]}", request=r.request, response=r)
         return r
+
+    def _log_call(self, device: str | None, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        # ``device`` picks another device of a multi-device server; None keeps this client's scope.
+        full = f"/d/{device}{path}" if device else self._scoped(path)
+        kw: dict[str, Any] = {} if body is None else {"json": body}
+        r = self._http.request(method, full, **kw)
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, r.text
+
+    def request_raw(self, seq: int, device: str | None = None, *, part: str = "request", body_only: bool = False) -> bytes | None:
+        """The raw bytes of a logged request (or its reply): the wire head plus stored body; see
+        :meth:`fakeprint.requestlog.RequestLogCalls.request_raw`."""
+        if part not in ("request", "response"):
+            raise ValueError("part must be 'request' or 'response'")
+        path = f"/v1/requests/{int(seq)}/raw?part={part}&what={'body' if body_only else 'all'}"
+        r = self._http.get(f"/d/{device}{path}" if device else self._scoped(path))
+        if r.status_code == 404:
+            return None
+        if r.status_code >= 400:
+            raise ApiError(f"GET {path}: {r.status_code} {r.text.strip()[:300]}", request=r.request, response=r)
+        return r.content
 
     def health(self) -> bool:
         return self._req("GET", "/health").text.strip() == "ok"

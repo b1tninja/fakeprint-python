@@ -14,6 +14,7 @@ from . import _paths
 from ._native import Server as _NativeServer
 from .client import ApiError, Capture, Client, Job, JobDocument, Status
 from .manager import Manager
+from .requestlog import RequestLogCalls
 from .soap import PrintClient
 from .ticket import PrintTicket
 
@@ -41,12 +42,19 @@ FAST_TIMING = {"processing_base_ms": 0, "processing_per_mib_ms": 0}
 TIMING_PRESETS = ("instant", "realistic", "default")
 
 
-class _Controls:
+class _Controls(RequestLogCalls):
     """Fault, injection, timing and level calls shared by :class:`Server` (its default device)
     and :class:`Device`; everything goes through ``self.control(method, path, body)``."""
 
     def control(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:  # pragma: no cover
         raise NotImplementedError
+
+    def _log_call(self, device: str | None, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        # A Server can reach any of its devices' logs; a Device is its own log.
+        devices = getattr(self, "devices", None)
+        if device is not None and isinstance(devices, Mapping):
+            return devices[device].control(method, path, body)  # type: ignore[no-any-return]
+        return self.control(method, path, body)
 
     # -- the library's fault plan (/v1/faults) -----------------------------------------------
     def faults(self, body: Mapping[str, Any] | None = None, **flags: Any) -> dict[str, Any]:
