@@ -50,6 +50,14 @@ except ImportError as exc:  # pragma: no cover - environment
         "install fakescan (pip install fakeprint[testpage]) or add it to PYTHONPATH"
     ) from exc
 
+import fakescan.safety as _shared  # noqa: E402
+
+
+def __getattr__(name: str) -> Any:
+    """Everything else (``SINKS``, ``PURE``, ``Sink``, ``is_covered``, ``AUTO`` ...) is read live from the shared module."""
+    return getattr(_shared, name)
+
+
 __all__ = [
     "ALLOW_REAL_ENV", "DeviceNotAllowed", "FAKE_UUID_PREFIX", "Installation", "LEGACY_DENY_ENVS", "Marked",
     "MarkedListing", "POLICY_ENV", "Policy", "PolicyError", "Verdict", "allowed", "assert_fake", "assert_fake_queue", "current_policy",
