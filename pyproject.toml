@@ -21,6 +21,8 @@ dependencies = ["httpx>=0.27"]
 # fakeprint.winprint is stdlib-only (ctypes); this extra only names the Windows-only feature.
 windows = []
 mcp = ["mcp>=1.0"]
+# fakeprint.testpage / testpage_analyze: the layout comes from fakescan, rasterising from pdfium, pixels from Pillow.
+testpage = ["pillow>=10", "pypdfium2", "fakescan"]
 dev = ["pytest>=8", "maturin>=1.7,<2"]
 
 [project.scripts]

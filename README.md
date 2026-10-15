@@ -171,6 +171,15 @@ klass)`); when none is installed skip with `registry.skip_message(...)`, which c
 instructions. Windows printers are matched by UUID found in the port string (or the device's exact IPP
 URL), never by name; a TCPMON `host:9100` port or a port naming two UUIDs is foreign.
 
+## Print test page and received-document analyzer
+
+`fakeprint.testpage` generates a deterministic print test page (PDF, or PNG at a stated dpi) from parameters (paper A0-A6 / B / Letter /
+Legal / Tabloid / custom, orientation, margins, colour, page / copy / side, job tag); `fakeprint.testpage_analyze` reads back what a
+printer RECEIVED (sheet size and page box, scale per axis, rotation / mirror, margins and clipped edges, QR, page / copy / side, colour
+and resolution results; "not a fakeprint test page" for foreign documents); `Client.job_analysis(job)` runs it on a job's stored
+document. No fixtures are stored; the layout comes from fakescan. See [docs/test-page.md](docs/test-page.md) (needs
+`pip install fakeprint[testpage]`).
+
 ## Layout
 
 ```text

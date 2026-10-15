@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -83,6 +84,8 @@ class Job:
     last_document_received: bool
     #: The IPP submission (``print_jobs[].ipp``: ``attributes``, ``scaling``, ``media``, ``effective_scale``...); None for a WS-Print job.
     ipp: dict[str, Any] | None = None
+    #: Optional test-page analysis summary (``Client.job(id, analysis=True)`` / ``Client.job_analysis``); never filled by the daemon.
+    analysis: dict[str, Any] | None = None
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Job:
@@ -258,14 +261,51 @@ class Client:
         """The job table, active and history, ascending by id."""
         return [Job.from_json(j) for j in self._req("GET", "/v1/jobs").json().get("print_jobs", [])]
 
-    def job(self, job_id: int) -> Job | None:
-        """``GET /v1/jobs/{id}``; None when the printer does not know the job."""
+    def job(self, job_id: int, *, analysis: bool = False) -> Job | None:
+        """``GET /v1/jobs/{id}``; None when the printer does not know the job.  ``analysis=True`` also fills ``Job.analysis`` with the
+        :meth:`job_analysis` summary of the received document (lazy, Python-side; see there)."""
+        j = self._job(job_id)
+        if j is not None and analysis:
+            from dataclasses import replace
+
+            j = replace(j, analysis=self.job_analysis(j)["summary"])
+        return j
+
+    def _job(self, job_id: int) -> Job | None:
         r = self._http.get(self._scoped(f"/v1/jobs/{job_id}"))
         if r.status_code == 404:
             return None
         if r.status_code >= 400:
             raise ApiError(f"GET /v1/jobs/{job_id}: {r.status_code} {r.text.strip()[:300]}", request=r.request, response=r)
         return Job.from_json(r.json())
+
+    def job_analysis(self, job: int | Job, *, params: Any = None, dpi: float = 150.0, pages: str | int = "first",
+                     detail: str = "fast") -> dict[str, Any]:
+        """Analyse the document a job RECEIVED against the fakeprint print test page (``fakeprint.testpage``).
+
+        Computed lazily, in Python, on request: the daemon (Rust) has no rasteriser, so there is no ``/v1/jobs/<id>/analysis`` route and
+        the daemon UI shows only the job rows.  The stored document is read from the path in the job row, so the daemon must share a
+        filesystem with this client (the embedded ``Server`` and a local daemon do).  Returns ``{"job_id", "document", "summary",
+        "analysis"}``: ``summary`` is :func:`fakeprint.testpage_analyze.brief` (scale, rotation / flip verdict, clipped edges, page /
+        copy / side, QR text, or ``is_test_page: false`` with the reason); ``analysis`` is the full report.  ``params``: the
+        :class:`fakeprint.testpage.PageParams` the page was generated from (default: recovered from the PDF).  Needs Pillow, pypdfium2 and
+        fakescan (``pip install fakeprint[testpage]``)."""
+        from .testpage_analyze import analyze_document, brief
+
+        jid = job.job_id if isinstance(job, Job) else int(job)
+        row = job if isinstance(job, Job) else self.job(jid)
+        path = fmt = None
+        if row is not None and row.documents:
+            path, fmt = row.documents[0].path, row.documents[0].format
+        if not path:
+            cap = next((c for c in self.jobs() if c.job_id == jid), None)
+            if cap is not None:
+                path, fmt = cap.path, cap.document_format
+        if not path or not Path(path).is_file():
+            raise FileNotFoundError(f"job {jid}: the stored document {path!r} is not readable from this machine")
+        data = Path(path).read_bytes()
+        rep = analyze_document(data, (fmt or "application/pdf").split(";")[0], params, dpi=dpi, pages=pages, detail=detail)
+        return {"job_id": jid, "document": {"path": path, "format": fmt, "bytes": len(data)}, "summary": brief(rep), "analysis": rep}
 
     def reset(self) -> Status:
         return Status(self._req("POST", "/v1/reset").json())
