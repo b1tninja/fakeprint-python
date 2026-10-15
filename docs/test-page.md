@@ -23,7 +23,9 @@ Two pieces, both pure Python (Pillow + pypdfium2 + fakescan at call time; nothin
    * **expected from fakescan** (not landed when this was written): `fakescan.diag.page_layout(params: dict) -> dict` with
      `{"schema", "layout_version", "sheet_mm": [w, h], "elements": [{"id", "kind", "drawn", "rect_mm", "expected": {...}, "primitives": [...]}],
      "qr_payload"}`; the primitive schema (`line rect poly circle text image qr`, sheet-relative mm, y down) is in the `fakeprint.testpage`
-     docstring. When this function exists it is used unchanged.
+     docstring. When this function exists it is used unchanged. (fakescan's work in progress spells it `diag_page_layout(dpi, version=3,
+     **params)` + `diag_page_primitives(layout)` with its own op names and raster-only ops; whichever name ships, translating it to this
+     primitive schema is the one job of `layout_for`.)
    * **fallback, clearly marked** (`layout["source"] == "fakescan.diag v2 fallback"`): the installed layout v2 (`diag_page_layout`): a fixed
      209.3 x 290.6 mm raster, no primitives, so the writer embeds its rendering at the sheet's top-left corner at its own physical size.
      Portrait only (`LayoutUnavailable` for landscape); on Letter it is clipped by the sheet (`layout["fallback"]["clipped_mm"]` says

@@ -146,9 +146,9 @@ def test_adapter_reports_its_source_and_limits():
 
 
 def test_qr_decoder_reads_fakescans_qr():
-    diag = pytest.importorskip("fakescan.diag")
-    lay = diag.diag_page_layout(150)
-    im = diag.render_diag_page(150).convert("L")
+    pytest.importorskip("fakescan.diag")
+    lay = tp.v2_layout(150)
+    im = tp.v2_render(150).convert("L")
     px = im.load()
     q = next(e for e in lay["elements"] if e["kind"] == "qr")
     k = lay["px_per_mm"]

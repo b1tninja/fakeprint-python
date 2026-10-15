@@ -138,6 +138,34 @@ class LayoutUnavailable(RuntimeError):
 # ------------------------------------------------------------------------------------------------ the adapter
 
 
+def v2_layout(dpi: int = 150) -> dict[str, Any]:
+    """The fixed-size layout v2 from the installed fakescan, whichever signature its ``diag`` has: ``diag_page_layout(dpi, version)``
+    (the released one, version 2 asked explicitly because newer fakescan defaults to the parametric v3) or the bare native call."""
+    from fakescan import diag
+
+    try:
+        return diag.diag_page_layout(dpi, 2)
+    except TypeError:  # an extension older than the Python module: no params argument
+        from fakescan import _native
+
+        return json.loads(_native.diag_layout_json(dpi, 2))
+
+
+def v2_render(dpi: int = 150):
+    """The v2 page as an RGB Pillow image (same compatibility rule as :func:`v2_layout`)."""
+    from fakescan import diag
+
+    try:
+        return diag.render_diag_page(dpi, 0, 2)
+    except TypeError:
+        from PIL import Image
+
+        from fakescan import _native
+
+        w, h, data = _native.diag_render_rgb(dpi, 0, 2)
+        return Image.frombytes("RGB", (w, h), bytes(data))
+
+
 def layout_for(params: PageParams) -> dict[str, Any]:
     """The layout JSON for ``params``: THE adapter, the only place that knows the layout source.
 
@@ -164,7 +192,7 @@ def layout_for(params: PageParams) -> dict[str, Any]:
         lay = dict(fn(params.to_dict()))
         lay.setdefault("source", "fakescan.diag.page_layout")
         return lay
-    lay = dict(diag.diag_page_layout(params.dpi if 50 <= params.dpi <= 300 else 150))
+    lay = dict(v2_layout(params.dpi if 50 <= params.dpi <= 300 else 150))
     w, h = params.size_mm()
     rw, rh = lay["raster_mm"]
     lay["source"] = "fakescan.diag v2 fallback"
@@ -395,10 +423,8 @@ def _text_width_pt(font: str, text: str, size: float) -> float:
 
 def _fallback_draw(pw: PdfWriter, params: PageParams, lay: dict[str, Any]) -> None:
     """The v2 fallback: the fakescan rendering placed at its physical size at the sheet's top-left corner."""
-    from fakescan import diag
-
     dpi = int(round(lay["dpi_effective"]))
-    img = diag.render_diag_page(dpi).convert("L" if params.colour == "mono" else "RGB")
+    img = v2_render(dpi).convert("L" if params.colour == "mono" else "RGB")
     rw, rh = lay["raster_mm"]
     pw.draw({"op": "image", "x": 0.0, "y": 0.0, "w": rw, "h": rh, "px_w": img.width, "px_h": img.height,
              "mode": "gray" if params.colour == "mono" else "rgb", "data_b64": base64.b64encode(img.tobytes()).decode("ascii")})
