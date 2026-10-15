@@ -293,6 +293,14 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
     d = best[1]
     geo = d.get("geometry", {})
     rep["geometry"] = geo
+    weak = _weak_crosses(geo)
+    if weak:
+        # fakescan.diag3 accepts any local maximum as a cross, and a fit through three points has residual ~0: crosses scoring far below the
+        # best one are clutter found where a cut-off corner used to be, so they count as not found (and a fit needs three real ones)
+        geo["weak_crosses"] = weak
+        if len(geo.get("registration", {})) - len(weak) < 3:
+            for k in ("scale_x_vs_nominal", "scale_y_vs_nominal"):
+                geo.pop(k, None)
     if d.get("summary", {}).get("fit") == "failed" or "scale_x_vs_nominal" not in geo or geo.get("fit_residual_px_rms", 0) > 2.5:
         rep["is_test_page"] = True
         rep["reason"] = ("orientation matched but fewer than 3 registration crosses could be fitted (are the corners cut off?)"
@@ -303,12 +311,22 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
         return rep
     rep["is_test_page"] = True
     summ = dict(d["summary"])
+    v3 = lay.get("layout_version") == 3 or (lay.get("schema") or "").startswith("fakescan.diag.layout/3")
+    if v3:  # fakescan.diag3 names the scale "vs nominal": the same quantity under the v2 analyzer's names
+        summ.setdefault("scale_x", summ["scale_x_vs_nominal"])
+        summ.setdefault("scale_y", summ["scale_y_vs_nominal"])
+        summ.setdefault("clipped_edges", [])
     off = geo["origin_offset_mm"]
     extent = [off[0] + rw * summ["scale_x"], off[1] + rh * summ["scale_y"]]
     over = [max(0.0, extent[0] - sheet[0]), max(0.0, extent[1] - sheet[1])]
     margins = {"left": round(off[0], 3), "top": round(off[1], 3),
                "right": round(sheet[0] - extent[0], 3), "bottom": round(sheet[1] - extent[1], 3)}
     clipped = list(summ.get("clipped_edges", []))
+    if v3 and params.colour == "mono":
+        # fakescan.diag3 finds the frame as "blue minus red", which a gray page does not have: its per-edge result would call every edge
+        # clipped.  Not assessable here; the margins and the layout-beyond-sheet figures below still are.
+        clipped = []
+        rep.setdefault("notes", []).append("frame clipping not assessed on a mono page (fakescan.diag3 frame detector needs colour)")
     if lay.get("fallback"):
         # v2 draws its page_border at the edge of its own raster, which the fallback places inside the sheet: a pdfium-resampled
         # 1 px hairline there is not evidence about the sheet edge, so it is not reported (the margins below are)
@@ -327,13 +345,19 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
         "fit_residual_px": round(geo.get("fit_residual_px_rms", 0.0), 3),
     }
     fields = (qr or {}).get("fields") or {}
-    for k_out, k_in in (("page", "page"), ("pages", "pages"), ("copy", "copy"), ("copies", "copies"), ("side", "side"), ("job", "job")):
+    if v3:
+        _read_v3_stamps(summary, d, fields)
+    for k_out, k_in in (() if v3 else (("page", "page"), ("pages", "pages"), ("copy", "copy"), ("copies", "copies"), ("side", "side"), ("job", "job"))):
         if k_in in fields:
             summary[k_out] = fields[k_in]
     if isinstance(fields.get("params"), dict):
         pp = fields["params"]
         summary.update({"page": pp.get("page"), "pages": pp.get("pages"), "copy": pp.get("copy"), "copies": pp.get("copies"),
                         "side": pp.get("side"), "job": pp.get("job")})
+    for k in ("colorchecker_mean_delta_e76", "channel_order", "flat_field_max_stdev", "flat_field_max_row_range",
+              "ruler_metric_pitch_error_pct", "ruler_inch_pitch_error_pct", "margin_errors_mm", "orientation"):
+        if v3 and k in summ:
+            summary["glyph_orientation" if k == "orientation" else k] = summ[k]
     for k in ("hue_err_deg_max_abs", "shadows_clipped_steps", "highlights_clipped_steps", "measure_bar_length_error_pct",
               "res_lines_v_last_resolvable_period_mm", "res_lines_h_last_resolvable_period_mm"):
         if k in summ:
@@ -342,6 +366,37 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
     if detail == "full":
         rep["elements"] = d.get("elements", {})
     return rep
+
+
+def _weak_crosses(geo: dict[str, Any]) -> list[str]:
+    """Registration crosses (v3 geometry) whose detection score is below 40 % of the best one's."""
+    reg = geo.get("registration") or {}
+    if not reg:
+        return []
+    top = max(v.get("score", 0.0) for v in reg.values())
+    return [k for k, v in reg.items() if v.get("score", 0.0) < 0.4 * top]
+
+
+def _read_v3_stamps(summary: dict[str, Any], d: dict[str, Any], fields: dict[str, Any]) -> None:
+    """Page / copy / side / job of a layout-v3 page as READ from the page (not as expected): the big page-number digits (``page``, 1-based)
+    and the order bars (``page_bars``) and the side marker (``side``, ``front`` / ``back``) come from fakescan.diag3's ``page_order``
+    element; ``pages`` (``of=``), ``copy`` and ``job`` come from the decoded QR payload, if it decoded.  ``page_order_ok`` says whether
+    the digits, the bars and the side marker agree with the layout the analysis was run against (the EXPECTED page)."""
+    el = d.get("elements", {})
+    po = el.get("page_order") or {}
+    pn, bars, sm = po.get("page_number") or {}, po.get("order_bars") or {}, po.get("side_marker") or {}
+    read = pn.get("read")
+    summary["page"] = int(read) if isinstance(read, str) and read.isdigit() else (read if isinstance(read, int) else None)
+    summary["page_bars"] = bars.get("filled_found")
+    summary["side"] = sm.get("side_read")
+    summary["page_order_ok"] = bool(pn.get("ok") and bars.get("ok") and sm.get("ok"))
+    summary["glyph_orientation"] = (el.get("orientation") or {}).get("verdict")
+    for k_out, k_in in (("pages", "of"), ("copy", "copy")):
+        v = fields.get(k_in)
+        if isinstance(v, str) and v.isdigit():
+            summary[k_out] = int(v)
+    if fields.get("job"):
+        summary["job"] = fields["job"]
 
 
 class _AffineView:
@@ -388,7 +443,6 @@ def analyze_document(data: bytes, fmt: str = "application/pdf", params: PagePara
         return out
     idx = range(n_pages) if pages == "all" else [pages if isinstance(pages, int) else 0]
     seq = sequence_from_pdf(data) if fmt == "application/pdf" else None
-    lay = layout_for(params)
     results = []
     for i in idx:
         if raster is not None:
@@ -402,7 +456,8 @@ def analyze_document(data: bytes, fmt: str = "application/pdf", params: PagePara
         p = params
         if seq and i < len(seq):
             p = params.replace(page=int(seq[i][0]), copy=int(seq[i][1]), side=str(seq[i][2]))
-        results.append(analyze_raster(r, p, layout=lay, detail=detail if i == next(iter(idx)) else "fast", facts=facts if i == next(iter(idx)) else None, page_index=i))
+        # the layout is per page: the page-number digits, bars, side marker and stamps differ between the pages of a document
+        results.append(analyze_raster(r, p, layout=None, detail=detail if i == next(iter(idx)) else "fast", facts=facts if i == next(iter(idx)) else None, page_index=i))
     first = results[0]
     first["document_pages"] = n_pages
     if len(results) > 1:
@@ -417,7 +472,7 @@ def brief(rep: dict[str, Any]) -> dict[str, Any]:
         return {"is_test_page": False, "reason": rep.get("reason", ""), "sheet_mm": rep.get("sheet_mm")}
     s = rep.get("summary") or {}
     keys = ("verdict_orientation", "scale_x", "scale_y", "skew_rotation_deg", "clipped_edges", "margins_mm", "sheet_mm", "sheet_size_ok",
-            "page", "pages", "copy", "copies", "side", "job", "qr_text")
+            "page", "pages", "copy", "copies", "side", "job", "qr_text", "page_bars", "page_order_ok", "glyph_orientation")
     out: dict[str, Any] = {"is_test_page": True, **{k: s[k] for k in keys if k in s}}
     if rep.get("reason"):
         out["reason"] = rep["reason"]

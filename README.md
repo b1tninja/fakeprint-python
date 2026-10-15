@@ -177,7 +177,9 @@ URL), never by name; a TCPMON `host:9100` port or a port naming two UUIDs is for
 Legal / Tabloid / custom, orientation, margins, colour, page / copy / side, job tag); `fakeprint.testpage_analyze` reads back what a
 printer RECEIVED (sheet size and page box, scale per axis, rotation / mirror, margins and clipped edges, QR, page / copy / side, colour
 and resolution results; "not a fakeprint test page" for foreign documents); `Client.job_analysis(job)` runs it on a job's stored
-document. No fixtures are stored; the layout comes from fakescan. See [docs/test-page.md](docs/test-page.md) (needs
+document. No fixtures are stored; the page is fakescan's parametric layout v3 (the same page at any sheet size and orientation: orientation
+glyphs, duplex BACK marker, page / copy / job stamp, QR, colour / resolution / scale targets; needs a fakescan-python extension built from
+fakescan `f55f668` or later, else a marked v2 fallback). See [docs/test-page.md](docs/test-page.md) (needs
 `pip install fakeprint[testpage]`).
 
 ## Layout

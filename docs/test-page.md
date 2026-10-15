@@ -5,7 +5,7 @@ Two pieces, both pure Python (Pillow + pypdfium2 + fakescan at call time; nothin
 * `fakeprint.testpage` - parameters, a size-parametric layout adapter, and a deterministic vector PDF / PNG writer.
 * `fakeprint.testpage_analyze` - given the document a printer RECEIVED, report what happened to the page on the way.
 
-![the A4 test page as rendered today (layout v2 fallback)](test-page-a4.png)
+![the A4 test page (fakescan layout v3)](test-page-a4.png)
 
 *(rendered by `render_pdf(PageParams(paper="a4")).png(100)`; documentation only, no test reads this file.)*
 
@@ -16,45 +16,48 @@ Two pieces, both pure Python (Pillow + pypdfium2 + fakescan at call time; nothin
    parameters give the same bytes (no dates, fixed `/ID`, Flate level 6). The sheet names known: A0-A6, ISO B3-B6, JIS B4-B6, Letter,
    Legal, Tabloid, Executive, Statement, any `210x297`.
 2. **One layout engine, and it is fakescan's.** What is on the page and where (millimetres, scaled to the sheet, elements that do not fit
-   marked `drawn: false` / `scale`) comes from the fakescan generator, together with the ground truth the analyzer checks. fakeprint-python
-   owns only the PDF writer (`PdfWriter`, draws the layout's vector primitives by their mm coordinates at ANY sheet size) and the analyzer.
-   `testpage.layout_for(params)` is the single adapter:
+   marked `drawn: false` with a `reason`, a `scale` on every element) comes from fakescan's parametric layout **v3** (default pattern `diag`,
+   `docs/diag-page-v3.md` in fakescan), together with the ground truth the analyzer checks. fakeprint-python owns only the PDF writer
+   (`PdfWriter`, draws primitives by their mm coordinates at ANY sheet size) and the analyzer. `testpage.layout_for(params)` is the single
+   adapter:
 
-   * **expected from fakescan** (not landed when this was written): `fakescan.diag.page_layout(params: dict) -> dict` with
-     `{"schema", "layout_version", "sheet_mm": [w, h], "elements": [{"id", "kind", "drawn", "rect_mm", "expected": {...}, "primitives": [...]}],
-     "qr_payload"}`; the primitive schema (`line rect poly circle text image qr`, sheet-relative mm, y down) is in the `fakeprint.testpage`
-     docstring. When this function exists it is used unchanged. (fakescan's work in progress spells it `diag_page_layout(dpi, version=3,
-     **params)` + `diag_page_primitives(layout)` with its own op names and raster-only ops; whichever name ships, translating it to this
-     primitive schema is the one job of `layout_for`.)
-   * **fallback, clearly marked** (`layout["source"] == "fakescan.diag v2 fallback"`): the installed layout v2 (`diag_page_layout`): a fixed
-     209.3 x 290.6 mm raster, no primitives, so the writer embeds its rendering at the sheet's top-left corner at its own physical size.
-     Portrait only (`LayoutUnavailable` for landscape); on Letter it is clipped by the sheet (`layout["fallback"]["clipped_mm"]` says
-     by how much and the analyzer reports exactly that).
+   * **v3** (`layout["source"] == "fakescan.diag v3"`): `fakescan.diag.diag_page_layout(dpi, **params)` for the layout and ground truth,
+     `diag_page_primitives(layout)` for the vector drawing, translated to the writer's schema (`layout["pdf_primitives"]`, paint order;
+     the same primitives per element under `elements[i]["primitives"]`). `PageParams` -> fakescan parameters (`v3_kwargs`): paper name (or
+     `width_mm` x `height_mm`), orientation, margin, bleed, `page` (1-based here, 0-based there), `total` = `pages`, `copy`, `side`, `job`
+     (upper-cased to fakescan's alphabet), `colour="mono"` -> `gray`. Translation: `rect polygon line circle` one to one; `grating` and
+     `ticks` expand to the rectangles fakescan paints; **text** is fakescan's 5x7 pixel font, whose cells are read from fakescan's render at the cell
+     centres and written as rectangles (exact glyphs, mirrored where fakescan mirrors them, vector, no copy of the font table here); the
+     raster-only ops (`ramp hue_wheel siemens_star zone_plate halftone qr`) are cropped from that render and embedded as images at their
+     exact physical rectangle. The render is 400 dpi (lower on sheets above A3 so it stays under 36 MP); the layout is generated at the same
+     density so crop edges fall on pixel edges. A4 is about 1.8 MB, mostly the zone plate / wheel / star / ramps; text, frames, patches, rulers,
+     glyphs, crosses and markers are vector.
+   * **fallback, clearly marked** (`layout["source"] == "fakescan.diag v2 fallback"`, only when the installed extension has no v3 --
+     `testpage.v3_available()` is false): the fixed layout v2 embedded as one raster at the sheet's top-left corner. Portrait only
+     (`LayoutUnavailable` for landscape); on Letter it is clipped by the sheet (`layout["fallback"]["clipped_mm"]`). No glyphs, stamp or
+     duplex set. Remove it when every extension in use has v3.
 
 3. **The writer is tested without any layout of ours**: `tests/test_testpage.py` feeds it a six-primitive double at A4, Letter, A5, A3,
-   Legal, 123 x 456 mm and A4 / Letter landscape and samples the rendered pixels at the mm positions.
+   Legal, 123 x 456 mm and A4 / Letter landscape and samples the rendered pixels at the mm positions. The v3 page is tested at nine
+   sheets (below).
 
 ## What is on the page, and why
 
-"v2 today" is what the fallback draws now; "parametric" is what the owner's list needs from fakescan's parametric layout (the analyzer
-already looks for it by element kind; nothing else changes).
+Everything below is on the v3 page at every size (an element that does not fit the sheet is dropped with a recorded reason; the mandatory
+rows and the QR are never dropped). The full element table is in fakescan's `docs/diag-page-v3.md`.
 
-| Element | Why it is there | Status |
-|---|---|---|
-| page border (1 px hairline at the sheet edge) | which edge survived; a printer that cannot print to the edge shows a gap | v2 (at its raster edge) |
-| printable-area frame (known inset) | measures the margin actually printed; a missing side = clipped | v2 (3 mm / top 12.5 mm), parametric (`margin_mm`) |
-| corner crop marks + registration crosses | position and scale to ~0.03 % over 190 mm, skew; the analyzer's fit | v2 (4 crosses + ticks) |
-| asymmetric glyph per corner (F R L P; back set G J Q 2) | rotation AND mirroring are obvious to a human and unambiguous to a program (the glyph is not symmetric under any of the 8 dihedral moves) | parametric |
-| duplex back-side variant ('BACK', different markers) | page 2 of a two-sided job must come out upright relative to page 1 | parametric |
-| `PAGE n OF N   COPY c OF C` stamp | collate and copy semantics visible on paper | parametric |
-| QR carrying job tag / page / copy / media / the parameters | machine decode; a decoder can regenerate the expected page | v2 QR (fixed text), parametric (parameters) |
-| dashed A4 and Letter outlines, labelled | what fits on which sheet | v2 (drawn only when it fits its raster), parametric |
-| metric + inch rulers, a 100 mm and a 4 in bar | scale by eye, and a long baseline for the analyzer | v2 |
-| line-weight ladder | thinnest line the path keeps | parametric |
-| line-pair patches, slanted-edge squares, Siemens star | resolution and sharpness | v2 |
-| hue wheel, R/G/B/neutral ramps, 16-step grey wedge, near-black / near-white steps and clip patches, colour patches | colour fidelity, mono conversion, clipping of shadows / highlights | v2 |
-| text 6-12 pt, pangram, Unicode block | legibility, font substitution | v2 (6-12 pt); pangram and Latin-1/WinAnsi block parametric (standard fonts carry nothing beyond WinAnsi) |
-| flat-field uniformity strips | banding, streaks, mottling | parametric |
+| Element | Why it is there |
+|---|---|
+| page border (hairline at the sheet edge), printable-area frame (blue, `margin_mm`), corner ticks, edge ticks | which edge survived; margins actually printed; a missing frame side = clipped |
+| 4 registration crosses + 4 corner markers (private 4x4-bit dictionary) | position and scale to ~0.01 % over 140-250 mm, skew; the analyzer's fit |
+| asymmetric glyph per corner (F R G J); the **back** side mirrors each glyph and rotates the assignment | rotation AND mirroring are obvious to a human and unambiguous to a program; page 2 of a duplex job must come out the same way up |
+| side marker (front inks the left half, back the right, label BACK), page number (big digits), order bars (page bars of 16), `PAGE n OF N / COPY c / JOB` stamp | collate, copy and duplex semantics visible on paper and machine-readable |
+| QR carrying page / side / paper / px / dpi / margin / copy / of / job (`lay=3`) | machine decode; `diag_spec_from_qr` regenerates the expected page |
+| dashed media outlines (A6, A5, Statement, A4, Letter, Legal, A3: only those smaller than the sheet in both directions, anchored top-left) | what fits on which sheet / where a printer places a smaller medium |
+| EBU bars, SMPTE, ColorChecker-24, R/G/B/neutral ramps, CMYK-ish ramps, rich black, hue wheel, near-black / near-white / clip, flat fields 10-90 %, halftone ladder | colour fidelity, channel order, mono conversion, clipping, banding, uniformity, dither |
+| Siemens star, slanted edges, line pairs, fine grid, zone plate, line-weight ladder (positive and reverse), circles / hexagon | resolution, sharpness, aspect ratio, thinnest line kept |
+| measure bar (the longest multiple of 10 mm that fits), metric and inch rulers | scale by eye and on a long baseline |
+| text ladder 6-12 pt, pangram, accent sample, reverse text, text on colour, legend | legibility. Text is fakescan's pixel font (uppercase Latin + a few accents): real fonts / Unicode are not on the page |
 
 ## `fakeprint.testpage`
 
@@ -92,7 +95,8 @@ rep = ta.analyze_raster(ta.Raster(img, dpi_x, dpi_y, None, "image/pwg-raster"), 
 Pipeline: rasterise at an exact dpi (pdfium, 4x oversample box-reduced, the sub-pixel sliver cropped; PNG / JPEG / TIFF at their density)
 -> regenerate the expected page from the parameters -> pick which of the 8 dihedral moves explains the received page (stretched and
 physical-top-left alignments, whichever matches; `ambiguous` flag when two are close) -> undo it -> run `fakescan.diag.analyze_diag_page`
-(fit of the registration crosses, per-element measurements) on the canonical raster -> margins, clipping, QR.
+(fit of the registration crosses, per-element measurements; v3 layouts are dispatched to `fakescan.diag3`, driven only by the layout) on the
+canonical raster -> margins, clipping, QR, and the page / copy / side stamps READ from the page.
 
 What it reports (`rep["summary"]` unless noted):
 
@@ -105,9 +109,12 @@ What it reports (`rep["summary"]` unless noted):
 | `sheet_mm`, `sheet_size_ok`, `expected_sheet_mm` | received sheet vs the parameters |
 | `margins_mm` | where the layout box landed on the sheet (left, top, right, bottom; negative = outside) |
 | `clipped_edges`, `layout_beyond_sheet_mm` | frame sides that did not survive, and layout that lies outside the sheet |
-| `qr_text`, `qr_ok`, `page`, `pages`, `copy`, `copies`, `side`, `job` | the QR decoded by `fakeprint.qrdecode` (versions 1-10, RS syndromes checked) and its fields |
+| `page`, `page_bars`, `side`, `page_order_ok` | READ from the page by `fakescan.diag3`: the big page-number digits (1-based), the filled order bars, the side marker (`front` / `back`); `page_order_ok` = all three agree with the page the parameters describe (a mismatch is reported, not hidden) |
+| `pages`, `copy`, `job`, `qr_text`, `qr_ok` | the QR decoded by `fakeprint.qrdecode` (versions 1-10, RS syndromes checked): `of=`, `copy=`, `job=` |
+| `glyph_orientation` | the corner-glyph verdict of the layout-driven analyzer on the canonicalised raster (`upright` / `rot180` / `flip_h` / `flip_v`) |
+| `colorchecker_mean_delta_e76`, `channel_order`, `flat_field_max_stdev`, `ruler_*_pitch_error_pct`, `margin_errors_mm` | colour, uniformity, ruler scale and frame-position results of the v3 analyzer |
 | `hue_err_deg_max_abs`, `shadows_clipped_steps`, `highlights_clipped_steps`, `res_lines_*_last_resolvable_period_mm`, ... | colour / ramp / resolution results; the whole per-element report is `rep["elements"]` with `detail="full"` |
-| `fit` = `"failed"` | fewer than 3 of the 4 registration crosses found (corners cut off) or a poor fit: orientation only, no measurements |
+| `fit` = `"failed"` | fewer than 3 of the 4 registration crosses found (corners cut off; crosses scoring under 40 % of the best are clutter, not crosses) or a poor fit: orientation only, no measurements |
 
 Limits, stated: the resolution figures are limited by the analysis dpi (150 by default; raise `dpi`), a printer's halftoning and a scan's
 noise are not modelled (it reads documents, not paper), the QR decoder does not correct errors, and it is pure Python (about 1.5 s a page,
@@ -127,7 +134,20 @@ machine).
 
 ## Tests
 
-`tests/test_testpage.py` (no fixtures): paper registry, the writer at eight sheet shapes, determinism, mono, PNG dpi, the adapter's
-fallback limits, the QR decoder (against fakescan's own QR, which also validates the tables: syndromes are zero), the analyzer against
-defects injected into a generated page (rotations, mirrors, 0.94 scale, cropped edge, cut corners, foreign documents, multi-page) and
-`Client.job_analysis` through the embedded server. The cross-client run is in `pdfcraft-fakeprint` (section k).
+`tests/test_testpage.py` (no fixtures): paper registry, the writer at eight sheet shapes, determinism, mono, PNG dpi, the adapter (v3 source,
+parameter mapping, the marked v2 fallback), the QR decoder (against fakescan's own QR, which also validates the tables: syndromes are zero),
+and, on fakescan layout v3 at A4, Letter, A5, A3, Legal, 123 x 456 mm, A4 / Letter landscape and A3 landscape mono: every sample of the layout
+(>100 per page) against the PDF rasterised through pdfium, then the analyzer (upright, scale 1.000 +- 0.002, no clipping, sheet size, frame margin,
+QR, page / bars / side / copy / pages read back); orientation faults (rotations, mirrors, transpose) injected into the raster at four of those
+sheets, and the corner glyphs alone naming rot180 / flip_h / flip_v; the BACK side (mirrored glyphs, right-half marker, `side=back` read); a
+stamp that disagrees with the expected page; a duplex / collated document read page by page; the analyzer on scaled, cropped, cut-corner and
+foreign documents; `Client.job_analysis` through the embedded server. The cross-client run is in `pdfcraft-fakeprint` (sections k, and the
+v3 phase of the print loop).
+
+## Known limits of the v3 analyzer as used here
+
+* `fakescan.diag3` finds the printable frame as "blue minus red": on a mono (gray) page every frame edge reads as clipped, so the analyzer does
+  not report frame clipping for `colour="mono"` (the margins and layout-beyond-sheet figures still apply).
+* `fakescan.diag3._fit` accepts any local maximum as a cross; with three of four crosses cut off it fits clutter with a residual of ~0. The wrapper
+  rejects crosses that score under 40 % of the best one.
+* Text on the page is the 5x7 pixel font; there is no real Unicode or TrueType sample.

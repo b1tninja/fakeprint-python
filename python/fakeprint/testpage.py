@@ -42,6 +42,7 @@ import math
 import re
 import zlib
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from typing import Any
 
 MM = 25.4
@@ -140,7 +141,7 @@ class LayoutUnavailable(RuntimeError):
 
 def v2_layout(dpi: int = 150) -> dict[str, Any]:
     """The fixed-size layout v2 from the installed fakescan, whichever signature its ``diag`` has: ``diag_page_layout(dpi, version)``
-    (the released one, version 2 asked explicitly because newer fakescan defaults to the parametric v3) or the bare native call."""
+    (version 2 asked explicitly because fakescan's default is the parametric v3) or the bare native call of an older extension."""
     from fakescan import diag
 
     try:
@@ -166,47 +167,253 @@ def v2_render(dpi: int = 150):
         return Image.frombytes("RGB", (w, h), bytes(data))
 
 
-def layout_for(params: PageParams) -> dict[str, Any]:
-    """The layout JSON for ``params``: THE adapter, the only place that knows the layout source.
+#: raster density of the fakescan render the adapter reads text cells and raster-only elements from (capped by ``MAX_LAYOUT_PIXELS``)
+LAYOUT_DPI = 400
+#: pixel budget of that render (an A3 sheet at 400 dpi is 31 MP; A0 would be 250 MP, so the density drops with the sheet size)
+MAX_LAYOUT_PIXELS = 36_000_000
+#: raster-only primitive ops (``vector: false`` in fakescan): they are cropped from the render and embedded as images
+_RASTER_OPS = ("ramp", "hue_wheel", "siemens_star", "zone_plate", "halftone", "qr")
 
-    EXPECTED (fakescan side, agent A; not landed when this was written)::
 
-        fakescan.diag.page_layout(params: dict) -> dict      # params = PageParams.to_dict()
+def layout_dpi(w_mm: float, h_mm: float) -> int:
+    """The density of the fakescan render for a ``w_mm`` x ``h_mm`` sheet."""
+    cap = math.sqrt(MAX_LAYOUT_PIXELS / (w_mm * h_mm)) * MM
+    return max(100, min(LAYOUT_DPI, int(cap)))
 
-    returning ``{"schema", "layout_version", "sheet_mm": [w, h], "elements": [...], "qr_payload": str}`` with each element
-    carrying ``primitives`` in the schema of this module's docstring (sheet-relative mm, y down) plus ``expected`` ground truth, and
-    elements that do not fit the sheet ``drawn: false`` (or ``scale``).  When that function exists it is used as is.
 
-    FALLBACK (clearly marked, NOT the target design): the installed ``fakescan.diag`` layout v2 (``diag_page_layout``).  It is a
-    fixed 209.3 x 290.6 mm raster with no primitives, so the writer embeds its rendering at the sheet's top-left corner at its
-    own physical size.  It is only meaningful on sheets about A4 size and larger; on smaller sheets (Letter is 279.4 mm tall) the
-    page is CLIPPED by the sheet, which is recorded in ``layout["fallback"]["clipped_mm"]``.  It has no corner orientation
-    markers, page / copy stamp or duplex set: those need fakescan's parametric layout.  ``layout["source"]`` says which path ran.
-    """
+@lru_cache(maxsize=1)
+def v3_available() -> bool:
+    """True when the installed fakescan has the parametric layout v3 (Python module AND native extension)."""
     try:
         from fakescan import diag
-    except Exception as e:  # noqa: BLE001
-        raise LayoutUnavailable(f"fakescan is not importable ({e}); the test page layout comes from fakescan.diag") from e
-    fn = getattr(diag, "page_layout", None)
-    if fn is not None:
-        lay = dict(fn(params.to_dict()))
-        lay.setdefault("source", "fakescan.diag.page_layout")
-        return lay
+
+        diag.diag_page_layout(50, paper="a6")
+        return diag.diag_page_primitives is not None
+    except Exception:  # noqa: BLE001  (ImportError, AttributeError, TypeError of an old extension...)
+        return False
+
+
+def v3_kwargs(params: PageParams) -> dict[str, Any]:
+    """:class:`PageParams` as the keyword parameters of ``fakescan.diag.diag_page_layout`` (layout v3).  Mapping: ``page`` (1-based here) is
+    fakescan's 0-based page index, ``pages`` its ``total``, ``copy`` is stamped as given, ``job`` is upper-cased to fakescan's alphabet,
+    ``colour="mono"`` is fakescan's ``gray``.  The sheet is passed as fakescan's paper name when it knows that size, else as ``width_mm`` x
+    ``height_mm`` (short x long); plus ``orientation``."""
+    w, h = params.size_mm()
+    short, long = min(w, h), max(w, h)
+    sheet: dict[str, Any] = {"width_mm": short, "height_mm": long}
+    if not (params.width_mm and params.height_mm):  # a named paper: let fakescan name it on the page (legend, QR) when it knows the size
+        from fakescan import diag
+
+        key = re.sub(r"[^a-z0-9]", "", params.paper.lower())
+        name = {"isob4": "B4", "isob5": "B5", "jisb4": "JIS-B4", "jisb5": "JIS-B5", "b4": "B4", "b5": "B5"}.get(key, key.upper())
+        known = diag.diag_paper_sizes().get(name)
+        if known and abs(min(known) - short) < 0.1 and abs(max(known) - long) < 0.1:
+            sheet = {"paper": name}
+    kw: dict[str, Any] = {
+        **sheet, "orientation": params.orientation, "margin_mm": params.margin_mm,
+        "page": params.page - 1, "copy": params.copy, "total": params.pages, "side": params.side,
+        "job": re.sub(r"[^A-Z0-9_\-]", "-", params.job.upper()), "colour": "gray" if params.colour == "mono" else "rgb",
+    }
+    if params.bleed_mm:
+        kw["bleed_mm"] = params.bleed_mm
+    return kw
+
+
+def _v3_pdf_primitives(lay: dict[str, Any], img: Any, mono: bool) -> list[dict[str, Any]]:
+    """Translate fakescan's vector primitive list (``diag_page_primitives``: millimetres, paint order) to the writer's schema.
+
+    * ``rect polygon line circle`` map one to one; ``grating`` and ``ticks`` expand to the rectangles fakescan paints for them;
+    * ``text`` is fakescan's own 5x7 pixel font: the cell grid of each string is READ from the render at the cell centres (ink = nearer to the
+      primitive's colour than to the background) and written as rectangles, so the glyphs are exact, vector, mirrored where fakescan mirrors
+      them, and no copy of the font table lives here;
+    * raster-only ops (``ramp hue_wheel siemens_star zone_plate halftone qr``) are cropped from the render at its density and embedded as
+      images at their exact physical rectangle."""
+    from fakescan import diag
+
+    k = lay["px_per_mm"]
+    px = img.load()
+    W, H = img.size
+    out: list[dict[str, Any]] = []
+
+    def at(x_mm: float, y_mm: float) -> tuple[int, int, int]:
+        v = px[min(max(int(x_mm * k), 0), W - 1), min(max(int(y_mm * k), 0), H - 1)]
+        return v if isinstance(v, tuple) else (v, v, v)
+
+    def merged(cells: list[tuple[int, int]], x0: float, y0: float, u: float, rgb: list[int]) -> list[dict[str, Any]]:
+        """Horizontal runs of ``(col, row)`` cells as rect primitives."""
+        rows: dict[int, list[int]] = {}
+        for c, r in cells:
+            rows.setdefault(r, []).append(c)
+        res = []
+        for r in sorted(rows):
+            cols = sorted(rows[r])
+            i = 0
+            while i < len(cols):
+                j = i
+                while j + 1 < len(cols) and cols[j + 1] == cols[j] + 1:
+                    j += 1
+                res.append({"op": "rect", "x": x0 + cols[i] * u, "y": y0 + r * u, "w": (cols[j] - cols[i] + 1) * u, "h": u, "fill": rgb})
+                i = j + 1
+        return res
+
+    for p in diag.diag_page_primitives(lay):
+        op, eid = p["op"], p.get("id", "")
+        if op == "rect":
+            x0, y0, x1, y1 = p["rect_mm"]
+            out.append({"op": "rect", "x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0, "fill": p["rgb"], "id": eid})
+        elif op == "polygon":
+            out.append({"op": "poly", "pts": p["points_mm"], "fill": p["rgb"], "id": eid})
+        elif op == "line":
+            d = p.get("dash_mm")
+            (xa, ya), (xb, yb) = p["from_mm"], p["to_mm"]
+            out.append({"op": "line", "x1": xa, "y1": ya, "x2": xb, "y2": yb, "w": p["width_mm"], "rgb": p["rgb"], "id": eid,
+                        **({"dash": d} if d else {})})
+        elif op == "circle":
+            st = p.get("stroke")
+            out.append({"op": "circle", "cx": p["centre_mm"][0], "cy": p["centre_mm"][1], "r": p["radius_mm"], "id": eid,
+                        **({"fill": p["fill"]} if p.get("fill") else {}),
+                        **({"stroke": st["rgb"], "sw": st["width_mm"]} if st else {})})
+        elif op == "grating":
+            x0, y0, x1, y1 = p["rect_mm"]
+            per = p["period_mm"]
+            a0, a1 = (x0, x1) if p["vertical_lines"] else (y0, y1)
+            s = a0
+            while s < a1 - 1e-9:
+                e = min(s + per / 2.0, a1)
+                r = ({"op": "rect", "x": s, "y": y0, "w": e - s, "h": y1 - y0} if p["vertical_lines"]
+                     else {"op": "rect", "x": x0, "y": s, "w": x1 - x0, "h": e - s})
+                out.append({**r, "fill": p["rgb"], "id": eid})
+                s += per
+        elif op == "ticks":
+            ox, oy = p["origin_mm"]
+            w = p["width_mm"]
+            tiers = p["tiers"]
+            for i in range(p["count"] + 1):
+                ln = next((t[1] for t in reversed(tiers) if i % t[0] == 0), 0.0)
+                if ln <= 0:
+                    continue
+                q = i * p["pitch_mm"]
+                if p["horizontal"]:
+                    y0 = oy if p["down"] else oy - ln
+                    out.append({"op": "rect", "x": ox + q - w / 2, "y": y0, "w": w, "h": ln, "fill": p["rgb"], "id": eid})
+                else:
+                    x0 = ox if p["down"] else ox - ln
+                    out.append({"op": "rect", "x": x0, "y": oy + q - w / 2, "w": ln, "h": w, "fill": p["rgb"], "id": eid})
+        elif op == "text":
+            u = 0.72 * p["pt"] * MM / 72.0 / 7.0
+            n = len(p["text"])
+            total = max(n, 1) * 6 - 1
+            x, y = p["x_mm"], p["y_mm"] - 2 * u  # row 0 of the 10-row extended glyph (two accent rows above the cap top)
+            ink = p["rgb"]
+            # background: the always-blank gutter column after each character (a one-character string: the cell left of the string)
+            gut = [at(x + (6 * i + 5.5) * u, y + (r + 0.5) * u) for i in range(n - 1) for r in range(10)] or [at(x - 0.5 * u, y + 4.5 * u)]
+            bg = max(set(gut), key=gut.count)
+
+            def d2(c: tuple[int, int, int], ref: Any) -> int:
+                return sum((c[i] - ref[i]) ** 2 for i in range(3))
+
+            cells = []
+            for r in range(10):
+                for c in range(total):
+                    if c % 6 == 5:
+                        continue
+                    v = at(x + (c + 0.5) * u, y + (r + 0.5) * u)
+                    if d2(v, ink) < d2(v, bg):
+                        cells.append((c, r))
+            for q in merged(cells, x, y, u, ink):
+                q["id"] = eid
+                out.append(q)
+        elif op in _RASTER_OPS:
+            if op in ("hue_wheel", "siemens_star"):
+                cx, cy = p["centre_mm"]
+                r = p["radius_mm"] + 1.0 / k
+                rect = (cx - r, cy - r, cx + r, cy + r)
+            else:
+                rect = tuple(p["rect_mm"])
+            px0, py0 = max(0, int(math.floor(rect[0] * k + 1e-6))), max(0, int(math.floor(rect[1] * k + 1e-6)))
+            px1, py1 = min(W, int(math.ceil(rect[2] * k - 1e-6))), min(H, int(math.ceil(rect[3] * k - 1e-6)))
+            if px1 <= px0 or py1 <= py0:
+                continue
+            crop = img.crop((px0, py0, px1, py1)).convert("L" if mono else "RGB")
+            out.append({"op": "image", "x": px0 / k, "y": py0 / k, "w": (px1 - px0) / k, "h": (py1 - py0) / k, "px_w": px1 - px0,
+                        "px_h": py1 - py0, "mode": "gray" if mono else "rgb", "data_b64": base64.b64encode(crop.tobytes()).decode("ascii"),
+                        "id": eid})
+        else:
+            raise ValueError(f"unknown fakescan primitive op {op!r} (id {eid!r})")
+    return out
+
+
+@lru_cache(maxsize=24)
+def _layout_v3(params: PageParams) -> dict[str, Any]:
+    from fakescan import diag
+
+    w, h = params.size_mm()
+    dpi = layout_dpi(w, h)
+    kw = v3_kwargs(params)
+    lay = dict(diag.diag_page_layout(dpi, **kw))
+    img = diag.render_diag_page(dpi, **kw)
+    prims = _v3_pdf_primitives(lay, img, params.colour == "mono")
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for q in prims:
+        by_id.setdefault(q["id"], []).append(q)
+    ids = {e["id"] for e in lay["elements"]}
+    els = []
+    for e in lay["elements"]:
+        e = dict(e)
+        e["primitives"] = by_id.get(e["id"], []) + by_id.get(e["id"] + "_outline", [])
+        els.append(e)
+    extra = [q for i, v in by_id.items() for q in v if i not in ids and not (i.endswith("_outline") and i[:-8] in ids)]
+    if extra:
+        els.append({"id": "_extra", "kind": "extra", "group": "extra", "drawn": True, "rect_mm": [0, 0, 0, 0], "primitives": extra})
+    lay["elements"] = els
+    lay["pdf_primitives"] = prims  # paint order across elements; the writer draws this list
+    lay["source"] = "fakescan.diag v3"
+    lay["sheet_mm"] = [w, h]
+    lay["layout_dpi"] = dpi
+    return lay
+
+
+def _layout_v2_fallback(params: PageParams, why: str) -> dict[str, Any]:
+    """FALLBACK (clearly marked, only for an extension without layout v3): the fixed-size layout v2, embedded as one raster at the sheet's
+    top-left corner at its physical size.  Portrait only; clipped on sheets smaller than 209 x 291 mm (``layout["fallback"]["clipped_mm"]``);
+    no orientation glyphs, page / copy stamp or duplex set."""
     lay = dict(v2_layout(params.dpi if 50 <= params.dpi <= 300 else 150))
     w, h = params.size_mm()
     rw, rh = lay["raster_mm"]
     lay["source"] = "fakescan.diag v2 fallback"
     lay["sheet_mm"] = [w, h]
     lay["fallback"] = {
-        "reason": "fakescan.diag.page_layout (parametric layout) is not available",
+        "reason": why,
         "placement_mm": [0.0, 0.0],
         "raster_mm": [rw, rh],
         "clipped_mm": [max(0.0, rw - w), max(0.0, rh - h)],
         "orientation_supported": params.orientation == "portrait",
     }
     if params.orientation != "portrait":
-        raise LayoutUnavailable("the v2 fallback layout is portrait only; landscape needs fakescan.diag.page_layout")
+        raise LayoutUnavailable("the v2 fallback layout is portrait only; landscape needs fakescan layout v3 (rebuild the fakescan extension)")
     return lay
+
+
+def layout_for(params: PageParams) -> dict[str, Any]:
+    """The layout JSON for ``params``: THE adapter, the only place that knows the layout source.
+
+    Source: fakescan's parametric layout v3 (``fakescan.diag.diag_page_layout`` + ``diag_page_primitives``), the same page at any paper
+    size / orientation.  The result is fakescan's layout dict (``elements`` with ground truth, ``qr_payload``, ``spec`` ...) plus
+
+    * ``source`` = ``"fakescan.diag v3"``, ``sheet_mm``, ``layout_dpi`` (the density of the render the text cells / raster-only elements
+      were read from);
+    * ``pdf_primitives``: the whole page in paint order in the writer's primitive schema (see the module docstring), and the same
+      primitives per element under ``elements[i]["primitives"]``.
+
+    When the installed extension has no layout v3 the clearly marked v2 fallback is used (``source == "fakescan.diag v2 fallback"``,
+    see :func:`_layout_v2_fallback`)."""
+    try:
+        from fakescan import diag  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        raise LayoutUnavailable(f"fakescan is not importable ({e}); the test page layout comes from fakescan.diag") from e
+    if v3_available():
+        return dict(_layout_v3(params))
+    return _layout_v2_fallback(params, "the installed fakescan has no parametric layout v3 (diag_page_layout(dpi, **params))")
 
 
 # ------------------------------------------------------------------------------------------------ the PDF writer
@@ -444,7 +651,7 @@ class TestPage:
 
 
 def _draw_page(pw: PdfWriter, params: PageParams, lay: dict[str, Any]) -> str:
-    prims = [p for e in lay["elements"] if e.get("drawn", True) for p in e.get("primitives", [])]
+    prims = lay.get("pdf_primitives") or [p for e in lay["elements"] if e.get("drawn", True) for p in e.get("primitives", [])]
     if not prims:
         _fallback_draw(pw, params, lay)
         return "fallback-raster"
