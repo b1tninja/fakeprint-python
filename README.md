@@ -209,3 +209,15 @@ routes (`/v1/queue`, `/v1/registry`, `/v1/reconcile`, ctl `mark_added` ...) belo
 (M2); against a build without them `Manager` raises `NotYet`.
 
 License: MIT OR Apache-2.0.
+
+## Test-harness device protection (`fakeprint.safety`)
+
+A thin adapter over `fakescan.safety` (one implementation for both emulators; pure Python, no Rust): the harness may only
+open, scan or print on devices that are **provably fake** (a device UUID in `FAKE_UUID_PREFIX`, or a loopback URL), and
+refuses everything else with `DeviceNotAllowed` before any call is made. It re-exports `Policy`, `install()`,
+`guarded()`, `guard_open` / `guard_submit`, `assert_fake`, `filter_refs` ... and adds `device_ref(server_or_device_or_row)` and
+`guarded_print_client(endpoint)`. Configuration is the environment variable `PDFCRAFT_TEST_DEVICE_POLICY`
+(`fakes-only` default, `deny=a,b;c` adds exclusions; the legacy `CRAFT_SCAN_DENY` / `PDFCRAFT_SCAN_DENY` / `CRAFT_PRINT_DENY` /
+`PDFCRAFT_PRINT_DENY` count as deny patterns). `fakeprint.winprint` keeps its own, stricter rule (registry `Printer UUID` of the
+queue's WSD port must be in the fake namespace) and `install()` adds the policy on top. `pytest_plugins = ["fakescan.safety_pytest"]`
+gives a harness conftest the autouse `device_policy` fixture and the startup self-check. Needs `fakescan` (`pip install fakeprint[testpage]`).
