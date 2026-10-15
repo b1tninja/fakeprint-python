@@ -321,6 +321,7 @@ def _marker_figures(rep: dict[str, Any], d: dict[str, Any], px_per_mm: float) ->
     if ru:
         rep["rulers"] = ru
         out["ruler_dpi"] = {a: {u: v["dpi"] for u, v in units.items()} for a, units in ru.items()}
+        out["ruler_scale"] = {a: {u: v["dpi"] / (px_per_mm * MM) for u, v in units.items()} for a, units in ru.items()}  # 1.0 = the analysis raster's own dpi
         out["ruler_length_error_mm"] = {a: {u: v["length_error_mm"] for u, v in units.items()} for a, units in ru.items()}
         out["ruler_baseline_mm"] = {a: {u: v["baseline_mm"] for u, v in units.items()} for a, units in ru.items()}
     return out
@@ -446,6 +447,7 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
         "fit_residual_px": round(geo.get("fit_residual_px_rms", 0.0), 3),
         "fit": geo.get("fit", "crosses"),
     }
+    summary["analysis_dpi"] = nominal
     summary.update(_marker_figures(rep, d, nominal / MM))
     if mo is not None:
         if mo.get("available"):

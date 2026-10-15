@@ -655,6 +655,7 @@ def test_rev1_markers_and_rulers_measure_a_scaled_page(need_rev1, scale):
     assert rep["is_test_page"] and s["scale_x"] == pytest.approx(scale, abs=0.004)
     assert s["ruler_dpi"]["x"]["mm"] == pytest.approx(150 * scale, rel=0.004) and s["ruler_dpi"]["y"]["in"] == pytest.approx(150 * scale, rel=0.004)
     assert s["marker_affine_dpi"] == pytest.approx([150 * scale] * 2, rel=0.004) and s["markers_found"] >= 16
+    assert s["analysis_dpi"] == 150 and s["ruler_scale"]["y"]["mm"] == pytest.approx(scale, rel=0.004)
 
 
 _DIHEDRAL = [("ROTATE_180", "rotated 180 degrees", False), ("FLIP_LEFT_RIGHT", "mirrored left-right", True),
