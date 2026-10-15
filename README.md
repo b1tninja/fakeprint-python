@@ -27,6 +27,8 @@ python -m pytest                                        # native tests skip when
 
 The crate depends on `../fakeprint/crates/fakeprint` by path and never edits it. The emulator's
 profiles are read from `../fakeprint/profiles` (`FAKEPRINT_PROFILES` or `FAKEPRINT_REPO` override).
+
+IPP `print-scaling` (PWG 5100.13): profiles advertise it through `print.scaling` (empty list = not advertised, see `minimal-ipp`) and `default_ticket.scaling`; an IPP job's row carries `Job.ipp`, with `Job.print_scaling` (the keyword in effect) and `Job.effective_scale` (the scale the printer would apply to the stored PDF's first page, from its `/MediaBox`, the job's media and the keyword).
 What the Rust library lacks is listed in [docs/needs-from-rust.md](docs/needs-from-rust.md).
 
 ## Use

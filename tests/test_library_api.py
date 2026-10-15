@@ -552,6 +552,37 @@ def test_ipp_endpoint_answers_when_enabled(server_cls):
         assert httpx.get(f"{off.base_url}/ipp/print").status_code == 404
 
 
+def _ipp_print_job(srv, job_attrs: bytes, doc: bytes) -> bytes:
+    import struct
+
+    def attr(tag, name, val):
+        return bytes([tag]) + struct.pack(">H", len(name)) + name.encode() + struct.pack(">H", len(val)) + val
+
+    ops = attr(0x47, "attributes-charset", b"utf-8") + attr(0x48, "attributes-natural-language", b"en")
+    ops += attr(0x45, "printer-uri", srv.default_device.ipp_endpoint.encode()) + attr(0x49, "document-format", b"application/pdf")
+    body = struct.pack(">BBHI", 2, 0, 2, 1) + b"" + ops + b"" + job_attrs + b"" + doc
+    r = httpx.post(f"{srv.base_url}/ipp/print", content=body, headers={"Content-Type": "application/ipp"})
+    assert r.status_code == 200
+    return r.content
+
+
+def test_print_scaling_is_a_profile_knob_and_the_job_row_reports_the_scale(server_cls):
+    pdf = b"%PDF-1.4\n<< /Type /Page /MediaBox [0 0 595.28 841.89] >>\n%%EOF\n"
+    kw = lambda n, v: bytes([0x44]) + len(n).to_bytes(2, "big") + n.encode() + len(v).to_bytes(2, "big") + v.encode()  # noqa: E731
+    letter = kw("media", "na_letter_8.5x11in") + kw("print-scaling", "auto-fit")
+    with server_cls(profile="multi-format") as on:
+        _ipp_print_job(on, letter, pdf)
+        (job,) = on.jobs()
+        assert job.print_scaling == "auto-fit" and job.ipp["attributes"]["print-scaling"] == "auto-fit"
+        assert job.effective_scale == pytest.approx(279.4 / 297.0, abs=5e-4)
+    with server_cls(profile="minimal-ipp") as off:
+        reply = _ipp_print_job(off, letter, pdf)
+        assert int.from_bytes(reply[2:4], "big") == 0x0001, "print-scaling is not advertised: accepted, the attribute reported as unsupported"
+        (job,) = off.jobs()
+        assert job.print_scaling is None and "print-scaling" not in job.ipp["attributes"]
+        assert job.effective_scale == 1.0
+
+
 # ---- size, limits and concurrency ------------------------------------------------------------
 
 

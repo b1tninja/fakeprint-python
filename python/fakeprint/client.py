@@ -81,6 +81,8 @@ class Job:
     k_octets_processed: int
     media_sheets_completed: int
     last_document_received: bool
+    #: The IPP submission (``print_jobs[].ipp``: ``attributes``, ``scaling``, ``media``, ``effective_scale``...); None for a WS-Print job.
+    ipp: dict[str, Any] | None = None
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Job:
@@ -94,7 +96,21 @@ class Job:
             k_octets_processed=int(d.get("k_octets_processed", 0)),
             media_sheets_completed=int(d.get("media_sheets_completed", 0)),
             last_document_received=bool(d.get("last_document_received", False)),
+            ipp=d.get("ipp"),
         )
+
+    @property
+    def print_scaling(self) -> str | None:
+        """The IPP ``print-scaling`` keyword in effect (the job's, else the printer's default); None when the printer does not advertise it
+        or the job did not come over IPP."""
+        return (self.ipp or {}).get("scaling")
+
+    @property
+    def effective_scale(self) -> float | None:
+        """The uniform scale the printer would apply to the first page of the stored PDF, from its page size, the job's media and
+        ``print-scaling`` (the stored document itself is not rescaled); None when unknown (not a flat PDF, not an IPP job)."""
+        v = (self.ipp or {}).get("effective_scale")
+        return None if v is None else float(v)
 
     @property
     def active(self) -> bool:
