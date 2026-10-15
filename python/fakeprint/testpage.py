@@ -21,6 +21,8 @@ are ``[r, g, b]`` 0..255; every key but the shape is optional)::
 
     {"op": "line",   "x1":, "y1":, "x2":, "y2":, "w": 0.2, "dash": [on, off], "rgb": [0, 0, 0]}
     {"op": "rect",   "x":, "y":, "w":, "h":, "fill": rgb, "stroke": rgb, "sw": 0.2, "dash": [on, off]}
+    {"op": "rects",  "rects": [[x, y, w, h], ...], "fill": rgb}      (ONE path, non-zero winding: touching or overlapping rects are
+                     a union, painted without anti-aliasing seams; :func:`coalesce_rects` builds these from runs of ``rect`` ops)
     {"op": "poly",   "pts": [[x, y], ...], "close": true, "fill": rgb, "stroke": rgb, "sw": 0.2}
     {"op": "circle", "cx":, "cy":, "r":, "fill": rgb, "stroke": rgb, "sw": 0.2}
     {"op": "text",   "x":, "y":, "size_pt": 10, "text": "...", "font": "sans|serif|mono", "bold": false,
@@ -487,6 +489,10 @@ class PdfWriter:
             o.append("q " + self._paint_path_prefix(fill, stroke, p)
                      + f"{self._x(p['x'])} {self._y(p['y'] + p['h'])} {_num(p['w'] * PT / MM)} {_num(p['h'] * PT / MM)} re "
                      + self._paint_op(fill, stroke) + " Q")
+        elif op == "rects":
+            if p["rects"]:
+                o.append("q " + self._col(p.get("fill", [0, 0, 0]), False) + " "
+                         + " ".join(f"{self._x(x)} {self._y(y + h)} {_num(w * PT / MM)} {_num(h * PT / MM)} re" for x, y, w, h in p["rects"]) + " f Q")
         elif op == "poly":
             pts = p["pts"]
             fill, stroke = p.get("fill"), p.get("stroke")
@@ -650,12 +656,32 @@ class TestPage:
         return render_png(self.pdf, dpi or self.params.dpi)
 
 
+def coalesce_rects(prims: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge every run of consecutive plain filled ``rect`` ops of one colour (no stroke, no dash) into one ``rects`` op.
+
+    fakescan's revision-1 fiducials (ArUco modules, chessboard / ChArUco squares, brackets, vertical ruler ticks, 5x7 text cells) are
+    rectangles that TOUCH.  Painted one by one, a rasteriser anti-aliases each shared edge twice (coverage 0.5 x 0.5 composites to 75 %
+    ink, not 100 %): a faint seam that moves marker corners and breaks a chessboard at some zoom levels.  One path with non-zero winding
+    is rasterised as a union, so a seam cannot appear at any zoom.  Paint order is kept (only adjacent ops of one colour merge)."""
+    out: list[dict[str, Any]] = []
+    for p in prims:
+        if p.get("op") == "rect" and p.get("stroke") is None and not p.get("dash") and p.get("fill") is not None:
+            fill = list(p["fill"])
+            if out and out[-1].get("op") == "rects" and out[-1]["fill"] == fill:
+                out[-1]["rects"].append([p["x"], p["y"], p["w"], p["h"]])
+            else:
+                out.append({"op": "rects", "rects": [[p["x"], p["y"], p["w"], p["h"]]], "fill": fill})
+        else:
+            out.append(p)
+    return out
+
+
 def _draw_page(pw: PdfWriter, params: PageParams, lay: dict[str, Any]) -> str:
     prims = lay.get("pdf_primitives") or [p for e in lay["elements"] if e.get("drawn", True) for p in e.get("primitives", [])]
     if not prims:
         _fallback_draw(pw, params, lay)
         return "fallback-raster"
-    for p in prims:
+    for p in coalesce_rects(prims):
         pw.draw(p)
     return "vector"
 

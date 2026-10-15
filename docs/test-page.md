@@ -5,9 +5,18 @@ Two pieces, both pure Python (Pillow + pypdfium2 + fakescan at call time; nothin
 * `fakeprint.testpage` - parameters, a size-parametric layout adapter, and a deterministic vector PDF / PNG writer.
 * `fakeprint.testpage_analyze` - given the document a printer RECEIVED, report what happened to the page on the way.
 
-![the A4 test page (fakescan layout v3)](test-page-a4.png)
+![the A4 test page (fakescan layout v3, revision 1)](test-page-a4.png)
 
-*(rendered by `render_pdf(PageParams(paper="a4")).png(100)`; documentation only, no test reads this file.)*
+*(rendered by `render_pdf(PageParams(paper="a4")).png(100)`; documentation only, no test reads these files.)*
+
+Closeup at 300 dpi (the PDF rasterised by pdfium): the dual-sided vertical ruler (millimetres on one edge, inches on the other, one zero line), an
+edge-midpoint ArUco marker in a window of the ruler, the dashed A5 outline and the frame:
+
+![closeup at 300 dpi: ruler, ArUco marker, frame](test-page-closeup.png)
+
+The board row (chessboard, ChArUco board, asymmetric circle grid), all vector:
+
+![closeup at 300 dpi: calibration boards](test-page-boards.png)
 
 ## Design rules
 
@@ -31,7 +40,9 @@ Two pieces, both pure Python (Pillow + pypdfium2 + fakescan at call time; nothin
      raster-only ops (`ramp hue_wheel siemens_star zone_plate halftone qr`) are cropped from that render and embedded as images at their
      exact physical rectangle. The render is 400 dpi (lower on sheets above A3 so it stays under 36 MP); the layout is generated at the same
      density so crop edges fall on pixel edges. A4 is about 1.8 MB, mostly the zone plate / wheel / star / ramps; text, frames, patches, rulers,
-     glyphs, crosses and markers are vector.
+     glyphs, crosses, ArUco markers, boards, circle grid, brackets and rulers are vector. **Touching rectangles** (ArUco modules, chessboard
+     squares, brackets, ruler ticks, text cells) are merged by `testpage.coalesce_rects` into one `rects` path per run of one colour, so
+     the union is rasterised without anti-aliasing seams at any zoom or in any renderer (pdfium shows none even per rect; others do).
    * **fallback, clearly marked** (`layout["source"] == "fakescan.diag v2 fallback"`, only when the installed extension has no v3 --
      `testpage.v3_available()` is false): the fixed layout v2 embedded as one raster at the sheet's top-left corner. Portrait only
      (`LayoutUnavailable` for landscape); on Letter it is clipped by the sheet (`layout["fallback"]["clipped_mm"]`). No glyphs, stamp or
@@ -49,14 +60,17 @@ rows and the QR are never dropped). The full element table is in fakescan's `doc
 | Element | Why it is there |
 |---|---|
 | page border (hairline at the sheet edge), printable-area frame (blue, `margin_mm`), corner ticks, edge ticks | which edge survived; margins actually printed; a missing frame side = clipped |
-| 4 registration crosses + 4 corner markers (private 4x4-bit dictionary) | position and scale to ~0.01 % over 140-250 mm, skew; the analyzer's fit |
+| 4 registration crosses | position and scale to ~0.01 % over 140-250 mm, skew; the analyzer's primary fit |
+| 8 ArUco markers (`DICT_4X4_50`, ids 0-7: four corners and four edge midpoints; OpenCV `cv2.aruco` decodes them), black / white corner L-brackets | an independent fit (affine + homography residual in mm), rotation / mirror from the marker content (no glyph needed), and the fallback fit when the crosses are cropped |
+| dual-sided rulers on both axes (metric on one edge, inch on the other, one zero line; vertical ones in the 15 mm fiducial columns of sheets from A5 up) | dpi per unit and axis, length error over a 100-300 mm baseline |
+| chessboard (9 x 6), ChArUco board (6 x 4, ids 8-19), asymmetric circle grid (6 x 5) | `cv2.findChessboardCorners`, ChArUco interpolation, `cv2.findCirclesGrid`: calibration and sub-pixel corner / centroid position |
 | asymmetric glyph per corner (F R G J); the **back** side mirrors each glyph and rotates the assignment | rotation AND mirroring are obvious to a human and unambiguous to a program; page 2 of a duplex job must come out the same way up |
 | side marker (front inks the left half, back the right, label BACK), page number (big digits), order bars (page bars of 16), `PAGE n OF N / COPY c / JOB` stamp | collate, copy and duplex semantics visible on paper and machine-readable |
 | QR carrying page / side / paper / px / dpi / margin / copy / of / job (`lay=3`) | machine decode; `diag_spec_from_qr` regenerates the expected page |
 | dashed media outlines (A6, A5, Statement, A4, Letter, Legal, A3: only those smaller than the sheet in both directions, anchored top-left) | what fits on which sheet / where a printer places a smaller medium |
 | EBU bars, SMPTE, ColorChecker-24, R/G/B/neutral ramps, CMYK-ish ramps, rich black, hue wheel, near-black / near-white / clip, flat fields 10-90 %, halftone ladder | colour fidelity, channel order, mono conversion, clipping, banding, uniformity, dither |
 | Siemens star, slanted edges, line pairs, fine grid, zone plate, line-weight ladder (positive and reverse), circles / hexagon | resolution, sharpness, aspect ratio, thinnest line kept |
-| measure bar (the longest multiple of 10 mm that fits), metric and inch rulers | scale by eye and on a long baseline |
+| measure bar (the longest multiple of 10 mm that fits) | scale by eye and on a long baseline |
 | text ladder 6-12 pt, pangram, accent sample, reverse text, text on colour, legend | legibility. Text is fakescan's pixel font (uppercase Latin + a few accents): real fonts / Unicode are not on the page |
 
 ## `fakeprint.testpage`
@@ -114,7 +128,10 @@ What it reports (`rep["summary"]` unless noted):
 | `glyph_orientation` | the corner-glyph verdict of the layout-driven analyzer on the canonicalised raster (`upright` / `rot180` / `flip_h` / `flip_v`) |
 | `colorchecker_mean_delta_e76`, `channel_order`, `flat_field_max_stdev`, `ruler_*_pitch_error_pct`, `margin_errors_mm` | colour, uniformity, ruler scale and frame-position results of the v3 analyzer |
 | `hue_err_deg_max_abs`, `shadows_clipped_steps`, `highlights_clipped_steps`, `res_lines_*_last_resolvable_period_mm`, ... | colour / ramp / resolution results; the whole per-element report is `rep["elements"]` with `detail="full"` |
-| `fit` = `"failed"` | fewer than 3 of the 4 registration crosses found (corners cut off; crosses scoring under 40 % of the best are clutter, not crosses) or a poor fit: orientation only, no measurements |
+| `fit` | `"crosses"` (the four registration crosses), `"markers"` (fewer than three real crosses survived, e.g. a cropped or shrink-to-fit page: the ArUco marker corners give the affine), `"failed"` (neither: orientation only, no measurements; never a fit to clutter) |
+| `markers_found` / `markers_expected`, `marker_detector`, `marker_rms_corner_err_mm` / `_px`, `marker_max_corner_err_mm`, `homography_residual_rms_mm` / `_max_mm`, `marker_affine_dpi`, `marker_mirrored`, `marker_orientation` | revision 1: ArUco markers of the PDF page read back (`detector` = `cv2` when `cv2.aruco` is importable, else fakescan's pure-Python detector; `detector=` argument forces one). The full report is `rep["markers"]` |
+| `ruler_dpi`, `ruler_length_error_mm`, `ruler_baseline_mm` | per axis (`x`, `y`) and unit (`mm`, `in`): dpi measured on the longest ruler, and the error of its outermost ticks over the baseline; the full report is `rep["rulers"]` (the vertical rulers exist from A5 up) |
+| `marker_orientation_check` | `detail="full"`: the markers read the RAW raster's rotation / flip (`ta.marker_orientation`: eight candidate transforms, the one under which most markers decode as themselves wins; no glyph, no whole-page comparison) and `agrees` says whether that is the pixels' verdict. A page too cropped for the whole-page comparison is recognised by the markers (`rep["orientation"]["source"] == "markers"`) |
 
 Limits, stated: the resolution figures are limited by the analysis dpi (150 by default; raise `dpi`), a printer's halftoning and a scan's
 noise are not modelled (it reads documents, not paper), the QR decoder does not correct errors, and it is pure Python (about 1.5 s a page,
@@ -144,10 +161,27 @@ stamp that disagrees with the expected page; a duplex / collated document read p
 foreign documents; `Client.job_analysis` through the embedded server. The cross-client run is in `pdfcraft-fakeprint` (sections k, and the
 v3 phase of the print loop).
 
+Revision 1 (`test_rev1_*`), at A4, Letter, A5, A3, Legal, 123 x 456 mm and A4 landscape unless stated: the page's elements are vector (no image
+primitive for markers, rulers, boards, brackets; 30 circles in the circle grid) and runs of rects are merged; no seam between black modules at
+150 / 300 / 600 dpi; every ArUco marker of the PDF rasterised at 150 and 300 dpi is found by the pure-Python detector with RMS corner error under
+0.45 px and a homography residual under 0.08 mm (A4 at 600 dpi: all but one right-edge marker, see below); the dpi per unit and axis read by
+the rulers is within 0.1 % and their end-tick length error under 0.25 mm; a 0.9407 (A4 shrunk onto Letter) and a 1.03 page are measured by the
+ruler dpi and the marker affine; rotation and flips (rot180, mirror, flip, 90 degree turns) are named from the markers alone at three sheets and
+agree with the pixel verdict; a cut page falls back to `fit == "markers"`, a page cut to a corner is recognised only by its markers and says
+`failed`; a mono page's frame clipping is assessed; cv2 (`pytest.importorskip("cv2")`, not part of the project venv) finds all markers at
+150 / 300 / 600 dpi.
+
 ## Known limits of the v3 analyzer as used here
 
-* `fakescan.diag3` finds the printable frame as "blue minus red": on a mono (gray) page every frame edge reads as clipped, so the analyzer does
-  not report frame clipping for `colour="mono"` (the margins and layout-beyond-sheet figures still apply).
-* `fakescan.diag3._fit` accepts any local maximum as a cross; with three of four crosses cut off it fits clutter with a residual of ~0. The wrapper
-  rejects crosses that score under 40 % of the best one.
+* Marker corner accuracy of fakescan's pure-Python detector is about 0.8 px worst corner at every dpi on pdfium rasters (0.07 mm at 300 dpi,
+  the same on fakescan's own raster; the PDF edges are exact, measured < 0.1 px at 600 dpi): RMS 0.16-0.31 px. cv2 (`CORNER_REFINE_SUBPIX`)
+  gives RMS 0.18 px at 300 and 600 dpi, 0.7 px at 150.
+* At 600 dpi A4 the right-edge marker (`marker_mr`) is decoded but its edge fit fails (also on fakescan's own raster): 19 of 20 found.
+* `fakescan.diag3._fit` checks the fitted scale against the layout's `dpi_effective` and ignores `scan_dpi`: a 150 dpi raster against the 400 dpi
+  layout the adapter makes is refused as an "implausible affine" (0.375 < 0.4). `testpage_analyze._analysis_layout` sets the layout's density to
+  the raster's.
+* `report["markers"]["orientation"]` of fakescan says `unknown` for a raster turned 180 degrees (every marker decodes as another id);
+  `testpage_analyze.marker_orientation` names all eight transforms by decoding under each candidate.
+* Layout revision 0 (an extension older than fakescan 196ddc0) is still analysed: the weak-cross rejection and the mono-frame workaround of the
+  analyzer remain for it, clearly marked LEGACY in the code, and there are no `markers` / `rulers`.
 * Text on the page is the 5x7 pixel font; there is no real Unicode or TrueType sample.

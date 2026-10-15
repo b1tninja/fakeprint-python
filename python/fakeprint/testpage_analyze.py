@@ -254,9 +254,85 @@ def _reference(params: PageParams, layout: dict[str, Any] | None, dpi: float = A
     return tp, render_pdf_exact(tp.pdf, dpi).img
 
 
+def _analysis_layout(lay: dict[str, Any], dpi: float) -> dict[str, Any]:
+    """The layout with its nominal density set to the raster's: fakescan.diag3 plausibility-checks the fitted scale against
+    ``dpi_effective`` (0.4 .. 2.5 x), and the adapter's layout is made at 100 .. 400 dpi whatever the received raster's density is
+    (a 150 dpi raster against a 400 dpi layout is 0.375 x and would be refused as an "implausible affine")."""
+    out = dict(lay)
+    out["dpi_effective"] = float(dpi)
+    out["px_per_mm"] = float(dpi) / MM
+    return out
+
+
+def _layout_revision(lay: dict[str, Any]) -> int:
+    return int(lay.get("layout_revision", 0) or 0)
+
+
+def marker_orientation(img: Any, lay: dict[str, Any], dpi: float, *, seed_scales: tuple[float, ...] = (1.0,)) -> dict[str, Any]:
+    """Which of the eight dihedral defects the received page has, read from the layout's ArUco markers alone (four corners and four edge midpoints) (no glyph, no page
+    correlation): the raster is transformed by each candidate fix and the markers are decoded where an upright page would have them
+    (pure-Python detector, +-3 mm); the fix under which most markers decode as themselves (right id, rotation 0, not mirrored) wins.
+    ``verdict`` uses the names of :func:`detect_orientation`; ``found`` is the number of markers read under that fix.  Needs
+    a revision-1 layout (``available: False`` otherwise)."""
+    from fakescan import diag
+    from fakescan import diag_markers as dm
+
+    marks = [e for e in lay["elements"] if e.get("kind") == "marker" and e.get("drawn", True) and e["id"].startswith("marker_")]  # not the ChArUco ones
+    if len(marks) < 3 or _layout_revision(lay) < 1:
+        return {"available": False, "verdict": None}
+    small = dict(_analysis_layout(lay, dpi), elements=marks)
+    scored = []
+    for name, label, rot, mir in _FIXES:
+        cand = _apply(img, name)
+        ras = diag._Raster(cand)
+        n = 0
+        for f in seed_scales:
+            k = dpi / MM * f
+            det = dm.detect_markers(cand, ras, diag._Affine(k, 0.0, 0.0, 0.0, k, 0.0), small, detector="python")
+            n = max(n, sum(1 for r in det["markers"].values()
+                           if r.get("found") and r.get("decoded_id") == r.get("marker_id") and r.get("rotation_deg") == 0 and not r.get("mirrored")))
+        scored.append((n, name, label, rot, mir))
+    scored.sort(key=lambda t: -t[0])
+    top = scored[0]
+    return {"available": True, "fix": top[1], "verdict": top[2], "rotation_deg": top[3], "mirrored": top[4], "found": top[0],
+            "runner_up_found": scored[1][0], "ambiguous": top[0] < 2 or scored[1][0] >= top[0]}
+
+
+def _marker_figures(rep: dict[str, Any], d: dict[str, Any], px_per_mm: float) -> dict[str, Any]:
+    """Copy the revision-1 ``markers`` / ``rulers`` of the fakescan report into ``rep``; return their headline figures for the summary."""
+    out: dict[str, Any] = {}
+    m, ru = d.get("markers"), d.get("rulers")
+    if m:
+        rep["markers"] = m
+        out["markers_found"], out["markers_expected"] = m["n_found"], m["n_expected"]
+        out["marker_detector"] = m["detector"]
+        out["marker_orientation"] = (m.get("orientation") or {}).get("verdict")
+        if "rms_corner_err_mm" in m:
+            out["marker_rms_corner_err_mm"] = m["rms_corner_err_mm"]
+            out["marker_rms_corner_err_px"] = m["rms_corner_err_mm"] * px_per_mm
+        if "max_corner_err_mm" in m:
+            out["marker_max_corner_err_mm"] = m["max_corner_err_mm"]
+        if "homography" in m:
+            out["homography_residual_rms_mm"] = m["homography"]["residual_rms_mm"]
+            out["homography_residual_max_mm"] = m["homography"]["residual_max_mm"]
+        if "affine" in m:
+            out["marker_affine_dpi"] = [m["affine"]["dpi_x"], m["affine"]["dpi_y"]]
+            out["marker_mirrored"] = m["affine"]["mirrored"]
+    if ru:
+        rep["rulers"] = ru
+        out["ruler_dpi"] = {a: {u: v["dpi"] for u, v in units.items()} for a, units in ru.items()}
+        out["ruler_length_error_mm"] = {a: {u: v["length_error_mm"] for u, v in units.items()} for a, units in ru.items()}
+        out["ruler_baseline_mm"] = {a: {u: v["baseline_mm"] for u, v in units.items()} for a, units in ru.items()}
+    return out
+
+
 def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any] | None = None, detail: str = "full",
-                   facts: dict[str, Any] | None = None, page_index: int = 0) -> dict[str, Any]:
-    """Analyse one received page raster against the page ``params`` describe.  ``detail``: ``full`` or ``fast``."""
+                   facts: dict[str, Any] | None = None, page_index: int = 0, detector: str = "auto") -> dict[str, Any]:
+    """Analyse one received page raster against the page ``params`` describe.  ``detail``: ``full`` or ``fast``.  ``detector``:
+    fakescan's ArUco detector (``auto`` / ``python`` / ``cv2``).  Layout revision 1 pages add ``markers`` (ArUco corner / edge markers:
+    corner error, homography residual in mm, flip / mirror verdict that does not use the orientation glyphs) and ``rulers`` (dpi per unit
+    per axis and the length error over the ruler's baseline) to the report; the markers also fit the page when fewer than three
+    registration crosses survive (``geometry.fit == "markers"``)."""
     from fakescan import diag
 
     lay = layout if layout is not None else layout_for(params)
@@ -268,6 +344,16 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
         rep["document"] = facts
     ori = detect_orientation(raster.img, ref, (raster.dpi_x, raster.dpi_y), ANALYSIS_DPI)
     rep["orientation"] = ori
+    rev1 = _layout_revision(lay) >= 1
+    mo: dict[str, Any] | None = None
+    if rev1 and (detail == "full" or not ori["match"]):
+        # the ArUco markers read the RAW raster's fault (no glyph, no page correlation); they also rescue a page that is too cropped for the
+        # whole-page comparison to recognise
+        mo = marker_orientation(raster.img, lay, raster.dpi_x, seed_scales=(1.0, 0.94))
+        rep["marker_orientation"] = mo
+        if not ori["match"] and mo.get("available") and mo["found"] >= 2 and not mo["ambiguous"]:
+            ori.update({"fix": mo["fix"], "verdict": mo["verdict"], "rotation_deg": mo["rotation_deg"], "mirrored": mo["mirrored"],
+                        "match": True, "ambiguous": False, "source": "markers"})
     if not ori["match"]:
         rep["reason"] = (f"not a fakeprint test page (or not this page): best of 8 orientations differs by {ori['score']} grey levels "
                          f"from the expected page (a blank page would give {ori['blank_score']})")
@@ -286,31 +372,39 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
     # the cross search is local, so try a few initial scales (1, the sheet-size ratio, a few usual fit-to-page factors) and keep the
     # fit with the smallest residual; stop at the first sub-half-pixel one
     hints = list(dict.fromkeys(round(h, 4) for h in (1.0, sheet[0] / exp_w, sheet[1] / exp_h, 0.94, 0.97, 1.03)))
+    alay = _analysis_layout(lay, nominal)
     best = None
     for hint in hints:
         a = (s0 * hint, 0.0, 0.0, 0.0, s0 * hint, 0.0)
-        r = diag.analyze_diag_page(img, lay, scan_dpi=nominal, init=a)
-        res = (r.get("geometry") or {}).get("fit_residual_px_rms")
-        n = (r.get("geometry") or {}).get("crosses_found", 0)
-        key = (n < 3, res if res is not None else 1e9)
+        r = diag.analyze_diag_page(img, alay, scan_dpi=nominal, init=a, detector=detector, **({} if rev1 else {"marker_fallback": False}))
+        g = r.get("geometry") or {}
+        fit = g.get("fit") if "affine" in g else None  # "crosses" | "markers" | None (failed)
+        res = g.get("fit_residual_px_rms")
+        if res is None and fit == "markers":  # the marker fit has no cross residual: the homography residual of the marker corners, in px
+            res = ((r.get("markers") or {}).get("homography") or {}).get("residual_rms_mm", 9.0) * nominal / MM
+        if fit == "crosses" and g.get("crosses_found", 0) < 3:
+            fit = None
+        key = (fit is None, fit != "crosses", res if res is not None else 1e9)
         if best is None or key < best[0]:
             best = (key, r)
-        if n >= 3 and res is not None and res < 0.5:
+        if fit == "crosses" and res is not None and res < 0.5:
             break
     d = best[1]
     geo = d.get("geometry", {})
     rep["geometry"] = geo
-    weak = _weak_crosses(geo)
-    if weak:
-        # fakescan.diag3 accepts any local maximum as a cross, and a fit through three points has residual ~0: crosses scoring far below the
-        # best one are clutter found where a cut-off corner used to be, so they count as not found (and a fit needs three real ones)
-        geo["weak_crosses"] = weak
-        if len(geo.get("registration", {})) - len(weak) < 3:
-            for k in ("scale_x_vs_nominal", "scale_y_vs_nominal"):
-                geo.pop(k, None)
+    if not rev1:
+        # LEGACY (layout revision 0, an extension older than fakescan 196ddc0): fakescan.diag3 accepted any local maximum as a cross, and a
+        # fit through three points has residual ~0: crosses scoring far below the best one are clutter found where a cut-off corner used
+        # to be, so they count as not found (and a fit needs three real ones).  Revision 1 does this itself (and falls back to the markers).
+        weak = _weak_crosses(geo)
+        if weak:
+            geo["weak_crosses"] = weak
+            if len(geo.get("registration", {})) - len(weak) < 3:
+                for k in ("scale_x_vs_nominal", "scale_y_vs_nominal"):
+                    geo.pop(k, None)
     if d.get("summary", {}).get("fit") == "failed" or "scale_x_vs_nominal" not in geo or geo.get("fit_residual_px_rms", 0) > 2.5:
         rep["is_test_page"] = True
-        rep["reason"] = ("orientation matched but fewer than 3 registration crosses could be fitted (are the corners cut off?)"
+        rep["reason"] = ("orientation matched but fewer than 3 registration crosses (and too few ArUco markers) could be fitted (are the corners cut off?)"
                          if "scale_x_vs_nominal" not in geo else
                          f"orientation matched but the registration fit is poor (residual {geo['fit_residual_px_rms']:.1f} px): measurements withheld")
         rep["summary"] = {"verdict_orientation": ori["verdict"], "rotation_deg_90s": ori["rotation_deg"], "mirrored": ori["mirrored"],
@@ -329,8 +423,8 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
     margins = {"left": round(off[0], 3), "top": round(off[1], 3),
                "right": round(sheet[0] - extent[0], 3), "bottom": round(sheet[1] - extent[1], 3)}
     clipped = list(summ.get("clipped_edges", []))
-    if v3 and params.colour == "mono":
-        # fakescan.diag3 finds the frame as "blue minus red", which a gray page does not have: its per-edge result would call every edge
+    if v3 and params.colour == "mono" and not rev1:
+        # LEGACY (layout revision 0; revision 1 scores the frame by luminance on gray pages): fakescan.diag3 finds the frame as "blue minus red", which a gray page does not have: its per-edge result would call every edge
         # clipped.  Not assessable here; the margins and the layout-beyond-sheet figures below still are.
         clipped = []
         rep.setdefault("notes", []).append("frame clipping not assessed on a mono page (fakescan.diag3 frame detector needs colour)")
@@ -350,7 +444,12 @@ def analyze_raster(raster: Raster, params: PageParams, *, layout: dict[str, Any]
         "sheet_mm": rep["received_sheet_mm"], "sheet_size_ok": rep["sheet_size_ok"],
         "qr_text": (qr or {}).get("text"), "qr_ok": bool(qr and qr["ok"]),
         "fit_residual_px": round(geo.get("fit_residual_px_rms", 0.0), 3),
+        "fit": geo.get("fit", "crosses"),
     }
+    summary.update(_marker_figures(rep, d, nominal / MM))
+    if mo is not None:
+        if mo.get("available"):
+            summary["marker_orientation_check"] = {"verdict": mo["verdict"], "found": mo["found"], "agrees": mo.get("fix") == ori["fix"]}
     fields = (qr or {}).get("fields") or {}
     if v3:
         _read_v3_stamps(summary, d, fields)
@@ -479,7 +578,8 @@ def brief(rep: dict[str, Any]) -> dict[str, Any]:
         return {"is_test_page": False, "reason": rep.get("reason", ""), "sheet_mm": rep.get("sheet_mm")}
     s = rep.get("summary") or {}
     keys = ("verdict_orientation", "scale_x", "scale_y", "skew_rotation_deg", "clipped_edges", "margins_mm", "sheet_mm", "sheet_size_ok",
-            "page", "pages", "copy", "copies", "side", "job", "qr_text", "page_bars", "page_order_ok", "glyph_orientation")
+            "page", "pages", "copy", "copies", "side", "job", "qr_text", "page_bars", "page_order_ok", "glyph_orientation",
+            "fit", "markers_found", "markers_expected", "marker_orientation", "homography_residual_rms_mm", "ruler_dpi")
     out: dict[str, Any] = {"is_test_page": True, **{k: s[k] for k in keys if k in s}}
     if rep.get("reason"):
         out["reason"] = rep["reason"]

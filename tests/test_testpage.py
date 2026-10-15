@@ -303,11 +303,24 @@ def test_analyzer_multipage_lists_pages():
     assert one  # the single page still analyses (above)
 
 
-def test_analyzer_cut_corners_say_so(a4):
+def test_analyzer_cut_corners_fall_back_to_the_markers(a4):
     p, page, r = a4
     cut = r.img.crop((0, 0, r.img.width - 400, r.img.height - 600))  # 68 mm right and 102 mm bottom: three of the four crosses are gone
     rep = ta.analyze_raster(ta.Raster(cut, 150, 150, None, "test"), p, detail="fast")
+    s = rep["summary"]
+    # revision 1: the ArUco markers that survive (top-left corner, top and left edge midpoints) fit the page
+    assert rep["is_test_page"] and s["fit"] == "markers" and rep["geometry"]["fit"] == "markers" and s["markers_found"] >= 3
+    assert s["scale_x"] == pytest.approx(1.0, abs=0.003) and s["scale_y"] == pytest.approx(1.0, abs=0.003)
+    assert {"right", "bottom"} <= set(s["clipped_edges"]) and s["homography_residual_rms_mm"] < 0.2
+
+
+def test_analyzer_cut_far_too_much_says_so(a4):
+    p, page, r = a4
+    cut = r.img.crop((0, 0, r.img.width - 500, r.img.height - 900))  # only the top-left 80 x 90 mm: one corner marker and two edge markers
+    rep = ta.analyze_raster(ta.Raster(cut, 150, 150, None, "test"), p, detail="fast")
     assert rep["is_test_page"] and rep["summary"]["fit"] == "failed" and "registration" in rep["reason"]
+    rep = ta.analyze_raster(ta.Raster(r.img.crop((0, 0, 300, 300)), 150, 150, None, "test"), p, detail="fast")
+    assert not rep["is_test_page"]
 
 
 @pytest.mark.embedded
@@ -456,7 +469,7 @@ def test_v3_corner_glyphs_alone_name_the_fault(need_v3, op, verdict):
     p = tp.PageParams(paper="letter", orientation="landscape")
     page = tp.render_pdf(p)
     r = ta.render_pdf_exact(page.pdf, 150)
-    d = fakescan_diag.analyze_diag_page(r.img.transpose(getattr(Image.Transpose, op)), page.layout, scan_dpi=150)
+    d = fakescan_diag.analyze_diag_page(r.img.transpose(getattr(Image.Transpose, op)), ta._analysis_layout(page.layout, 150), scan_dpi=150)
     assert d["elements"]["orientation"]["verdict"] == verdict
 
 
@@ -503,3 +516,201 @@ def test_v3_page_placed_small_or_large_on_its_sheet_is_still_recognised(need_v3,
     s = rep["summary"]
     assert rep["is_test_page"] and s["scale_x"] == pytest.approx(f, abs=0.004) and s["scale_y"] == pytest.approx(f, abs=0.004)
     assert s["verdict_orientation"] == "upright"
+
+
+# ---- revision 1: the computer-vision fiducials and dual rulers as vector drawing ---------------------------------------------------------
+
+
+@pytest.fixture
+def need_rev1(need_v3):
+    lay = tp.layout_for(tp.PageParams(paper="a5"))
+    if lay.get("layout_revision", 0) < 1:
+        pytest.skip("the installed fakescan extension is layout v3 revision 0 (rebuild fakescan-python at fakescan 196ddc0 or later)")
+
+
+REV1_SHEETS = [
+    pytest.param(dict(paper="a4"), id="a4"), pytest.param(dict(paper="letter"), id="letter"), pytest.param(dict(paper="a5"), id="a5"),
+    pytest.param(dict(paper="a3"), id="a3"), pytest.param(dict(paper="legal"), id="legal"), pytest.param(dict(paper="123x456"), id="custom"),
+    pytest.param(dict(paper="a4", orientation="landscape"), id="a4-landscape"),
+]
+
+
+def _el(lay, eid):
+    return next(e for e in lay["elements"] if e["id"] == eid)
+
+
+@pytest.mark.parametrize("kw", REV1_SHEETS)
+def test_rev1_elements_are_drawn_as_vectors(need_rev1, kw):
+    page = tp.render_pdf(tp.PageParams(**kw))
+    lay = page.layout
+    assert lay["layout_revision"] == 1
+    drawn = {e["id"]: e for e in lay["elements"] if e.get("drawn", True)}
+    for eid in ("marker_tl", "marker_tr", "marker_bl", "marker_br", "marker_tm", "marker_bm", "ruler_metric", "ruler_inch",
+                "bracket_tl", "bracket_br", "chessboard", "charuco_board", "circle_grid"):
+        if eid not in drawn:  # dropped on a sheet too small for them (brackets: no fiducial columns), with a recorded reason
+            assert eid in ("bracket_tl", "bracket_br", "chessboard", "charuco_board", "circle_grid") and _el(lay, eid).get("reason"), eid
+            continue
+        assert drawn[eid]["primitives"] and not [q for q in drawn[eid]["primitives"] if q["op"] == "image"], f"{eid} must be vector"
+    if "circle_grid" in drawn:
+        assert sum(1 for q in drawn["circle_grid"]["primitives"] if q["op"] == "circle") == 30
+    # touching rectangles are merged into single paths
+    ops = tp.coalesce_rects(lay["pdf_primitives"])
+    assert len(ops) < len(lay["pdf_primitives"]) and any(q["op"] == "rects" and len(q["rects"]) > 10 for q in ops)
+
+
+def test_coalesce_rects_keeps_paint_order_and_only_merges_plain_fills():
+    a = {"op": "rect", "x": 0, "y": 0, "w": 1, "h": 1, "fill": [0, 0, 0]}
+    b = {"op": "rect", "x": 1, "y": 0, "w": 1, "h": 1, "fill": [0, 0, 0]}
+    c = {"op": "rect", "x": 2, "y": 0, "w": 1, "h": 1, "fill": [255, 255, 255]}
+    d = {"op": "rect", "x": 3, "y": 0, "w": 1, "h": 1, "fill": [0, 0, 0], "stroke": [1, 1, 1]}
+    out = tp.coalesce_rects([a, b, c, d, a])
+    assert [q["op"] for q in out] == ["rects", "rects", "rect", "rects"]
+    assert out[0]["rects"] == [[0, 0, 1, 1], [1, 0, 1, 1]] and out[1]["fill"] == [255, 255, 255] and out[2] is d
+
+
+@pytest.mark.parametrize("dpi", [150, 300, 600])
+@pytest.mark.parametrize("kw", [dict(paper="a4"), dict(paper="letter", orientation="landscape")], ids=["a4", "letter-landscape"])
+def test_rev1_touching_modules_have_no_seams_at_any_zoom(need_rev1, kw, dpi):
+    """Adjacent black ArUco modules are rects that touch.  pdfium paints abutting rects without a seam even one by one (measured), other
+    renderers anti-alias each shared edge twice (a faint seam), which is why the writer merges runs of rects into one path
+    (``test_rev1_elements_are_drawn_as_vectors`` pins the merge); this pins the pixels: both sides of an edge between two black cells are
+    black at every zoom."""
+    page = tp.render_pdf(tp.PageParams(**kw))
+    r = ta.render_pdf_exact(page.pdf, dpi)
+    k = dpi / MM
+    checked = 0
+    for eid in ("marker_tl", "marker_tr", "marker_bm", "marker_ml"):
+        ex = _el(page.layout, eid)["expected"]
+        x0, y0 = min(c[0] for c in ex["corners_mm"]), min(c[1] for c in ex["corners_mm"])
+        m, cells = ex["module_mm"], ex["cells"]
+        for row in range(6):
+            for col in range(6):
+                if col < 5 and cells[row][col] == "1" and cells[row][col + 1] == "1":  # black | black: the shared vertical edge
+                    px, py = (x0 + (col + 1) * m) * k, (y0 + (row + 0.5) * m) * k
+                    g = [r.img.getpixel((int(px) + dx, int(py)))[0] for dx in (-1, 0)]
+                    assert max(g) < 40, (eid, row, col, g, dpi)
+                    checked += 1
+                if row < 5 and cells[row][col] == "1" and cells[row + 1][col] == "1":  # black over black: the shared horizontal edge
+                    px, py = (x0 + (col + 0.5) * m) * k, (y0 + (row + 1) * m) * k
+                    g = [r.img.getpixel((int(px), int(py) + dy))[0] for dy in (-1, 0)]
+                    assert max(g) < 40, (eid, row, col, g, dpi)
+                    checked += 1
+    assert checked > 20
+
+
+@pytest.mark.parametrize("dpi", [150, 300])
+@pytest.mark.parametrize("kw", REV1_SHEETS)
+def test_rev1_markers_are_found_and_accurate_in_the_pdf(need_rev1, kw, dpi):
+    """Every ArUco marker of the PDF page, rasterised by pdfium, is decoded by fakescan's pure-Python detector and its corners are where the
+    layout says (RMS corner error well under a pixel at the analysis dpi)."""
+    p = tp.PageParams(**kw)
+    page = tp.render_pdf(p)
+    r = ta.render_pdf_exact(page.pdf, dpi)
+    rep = ta.analyze_raster(r, p, detail="fast", detector="python")
+    s = rep["summary"]
+    assert rep["is_test_page"], rep.get("reason")
+    m = rep["markers"]
+    assert m["n_found"] == m["n_expected"] >= 6 and not m["missing"] and m["detector"] == "python"
+    assert s["marker_orientation"] == "upright" and s["marker_mirrored"] is False
+    assert s["marker_rms_corner_err_px"] < 0.45 and s["marker_max_corner_err_mm"] < 1.3 * 25.4 / dpi, s
+    assert s["homography_residual_rms_mm"] < 0.08, s["homography_residual_rms_mm"]
+    assert s["marker_affine_dpi"] == pytest.approx([dpi, dpi], rel=0.002)
+
+
+def test_rev1_markers_at_600_dpi_a4(need_rev1):
+    """600 dpi: all but fakescan's known miss (an edge-fit failure of the right-edge marker, on fakescan's own raster as well) are found."""
+    p = tp.PageParams(paper="a4")
+    rep = ta.analyze_raster(ta.render_pdf_exact(tp.render_pdf(p).pdf, 600), p, detail="fast", detector="python")
+    m = rep["markers"]
+    assert m["n_found"] >= m["n_expected"] - 1 and set(m["missing"]) <= {"marker_mr"}
+    assert rep["summary"]["marker_rms_corner_err_px"] < 0.45
+
+
+@pytest.mark.parametrize("kw", REV1_SHEETS)
+def test_rev1_rulers_read_the_dpi_per_unit_and_axis(need_rev1, kw):
+    p = tp.PageParams(**kw)
+    r = ta.render_pdf_exact(tp.render_pdf(p).pdf, 200)
+    rep = ta.analyze_raster(r, p, detail="fast", detector="python")
+    ru = rep["rulers"]
+    columns = _el(rep["geometry"] and tp.layout_for(p), "ruler_v_metric").get("drawn", True)  # narrow sheets have no fiducial columns: no vertical rulers
+    assert set(ru) == ({"x", "y"} if columns else {"x"}) and all(set(ru[a]) == {"mm", "in"} for a in ru)
+    for a in ru:
+        for u in ru[a]:
+            v = ru[a][u]
+            assert v["dpi"] == pytest.approx(200, rel=0.001), (a, u, v)
+            assert abs(v["length_error_mm"]) < 0.25 and v["baseline_mm"] > 40, (a, u, v)  # <= 2 px at 200 dpi: end-tick centroid noise
+    assert rep["summary"]["ruler_dpi"]["x"]["mm"] == ru["x"]["mm"]["dpi"]
+
+
+@pytest.mark.parametrize("scale", [0.9407, 1.03])
+def test_rev1_markers_and_rulers_measure_a_scaled_page(need_rev1, scale):
+    """The A4 page printed shrink-to-fit on Letter (0.9407) and a 3 % zoom: the ruler dpi and the marker affine say the scale."""
+    from PIL import Image
+
+    p = tp.PageParams(paper="a4")
+    r = ta.render_pdf_exact(tp.render_pdf(p).pdf, 150)
+    small = r.img.resize((round(r.img.width * scale), round(r.img.height * scale)), Image.Resampling.LANCZOS)
+    rep = ta.analyze_raster(ta.Raster(small, 150, 150, None, "test"), p, detail="fast", detector="python")
+    s = rep["summary"]
+    assert rep["is_test_page"] and s["scale_x"] == pytest.approx(scale, abs=0.004)
+    assert s["ruler_dpi"]["x"]["mm"] == pytest.approx(150 * scale, rel=0.004) and s["ruler_dpi"]["y"]["in"] == pytest.approx(150 * scale, rel=0.004)
+    assert s["marker_affine_dpi"] == pytest.approx([150 * scale] * 2, rel=0.004) and s["markers_found"] >= 16
+
+
+_DIHEDRAL = [("ROTATE_180", "rotated 180 degrees", False), ("FLIP_LEFT_RIGHT", "mirrored left-right", True),
+             ("FLIP_TOP_BOTTOM", "flipped top-bottom", True), ("ROTATE_90", "rotated 90 degrees counter-clockwise", False),
+             ("ROTATE_270", "rotated 90 degrees clockwise", False)]
+
+
+@pytest.mark.parametrize("kw", [dict(paper="a4"), dict(paper="letter", orientation="landscape"), dict(paper="a5", side="back", page=2, pages=2)],
+                         ids=["a4", "letter-landscape", "a5-back"])
+def test_rev1_markers_alone_name_rotation_and_flip(need_rev1, kw):
+    """The eight ArUco markers read the fault off the RAW raster: no orientation glyph, no whole-page comparison."""
+    from PIL import Image
+
+    p = tp.PageParams(**kw)
+    page = tp.render_pdf(p)
+    r = ta.render_pdf_exact(page.pdf, 150)
+    up = ta.marker_orientation(r.img, page.layout, 150)
+    assert up["available"] and up["fix"] is None and up["found"] == 8 and not up["ambiguous"]
+    for op, verdict, mirrored in _DIHEDRAL:
+        faulty = r.img.transpose(getattr(Image.Transpose, op))
+        mo = ta.marker_orientation(faulty, page.layout, 150)
+        assert mo["verdict"] == verdict and mo["mirrored"] is mirrored and mo["found"] == 8 and not mo["ambiguous"], (op, mo)
+        # the same fault through analyze_raster: the markers and the pixels agree, and the page is then measured upright
+        rep = ta.analyze_raster(_variant(r, faulty), p, detector="python")
+        s = rep["summary"]
+        assert rep["is_test_page"] and s["verdict_orientation"] == verdict and s["marker_orientation_check"]["agrees"], (op, s.get("marker_orientation_check"))
+        assert s["marker_orientation"] == "upright" and s["glyph_orientation"] == "upright"
+
+
+def test_rev1_markers_recognise_a_page_too_cropped_for_the_pixels(need_rev1):
+    """A rotated page of which only the top-left 80 x 90 mm survive (no fit is possible) is no longer close to the expected page as a picture; the markers still say rotated."""
+    from PIL import Image
+
+    p = tp.PageParams(paper="a4")
+    r = ta.render_pdf_exact(tp.render_pdf(p).pdf, 150)
+    part = r.img.crop((0, 0, r.img.width - 500, r.img.height - 900)).transpose(Image.Transpose.ROTATE_180)  # the part that was kept, turned
+    rep = ta.analyze_raster(ta.Raster(part, 150, 150, None, "test"), p, detail="fast", detector="python")
+    assert rep["is_test_page"] and rep["orientation"].get("source") == "markers" and rep["summary"]["verdict_orientation"] == "rotated 180 degrees"
+    assert rep["summary"]["fit"] == "failed"
+
+
+def test_rev1_cv2_detects_the_pdf_markers_when_available(need_rev1):
+    cv2 = pytest.importorskip("cv2")
+    if not hasattr(cv2, "aruco"):
+        pytest.skip("opencv without the aruco module")
+    p = tp.PageParams(paper="a4")
+    for dpi in (150, 300, 600):
+        rep = ta.analyze_raster(ta.render_pdf_exact(tp.render_pdf(p).pdf, dpi), p, detail="fast", detector="cv2")
+        assert rep["markers"]["detector"] == "cv2" and rep["markers"]["n_found"] == rep["markers"]["n_expected"]
+
+
+def test_rev1_mono_page_frame_clipping_is_assessed(need_rev1):
+    """fakescan revision 1 scores the printable frame by luminance on gray pages: an intact mono page has no clipped edge, a cut one has."""
+    p = tp.PageParams(paper="a4", colour="mono")
+    r = ta.render_pdf_exact(tp.render_pdf(p).pdf, 150)
+    assert ta.analyze_raster(r, p, detail="fast", detector="python")["summary"]["clipped_edges"] == []
+    cut = r.img.crop((0, 0, r.img.width - 40, r.img.height - 60))
+    s = ta.analyze_raster(ta.Raster(cut, 150, 150, None, "test"), p, detail="fast", detector="python")["summary"]
+    assert {"right", "bottom"} <= set(s["clipped_edges"]) and "left" not in s["clipped_edges"]
