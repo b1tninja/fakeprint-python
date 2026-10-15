@@ -28,6 +28,7 @@ try:
         Verdict,
         allowed,
         assert_fake,
+        assert_fake_queue,
         current_policy,
         filter_refs,
         guard,
@@ -37,6 +38,7 @@ try:
         install,
         is_fake,
         normalise_uuid,
+        queue_ref,
         self_check,
         set_policy,
         use_policy,
@@ -50,9 +52,9 @@ except ImportError as exc:  # pragma: no cover - environment
 
 __all__ = [
     "ALLOW_REAL_ENV", "DeviceNotAllowed", "FAKE_UUID_PREFIX", "Installation", "LEGACY_DENY_ENVS", "Marked",
-    "MarkedListing", "POLICY_ENV", "Policy", "PolicyError", "Verdict", "allowed", "assert_fake", "current_policy",
+    "MarkedListing", "POLICY_ENV", "Policy", "PolicyError", "Verdict", "allowed", "assert_fake", "assert_fake_queue", "current_policy",
     "device_ref", "filter_refs", "guard", "guard_open", "guard_submit", "guarded", "guarded_print_client", "install",
-    "is_fake", "normalise_uuid", "self_check", "set_policy", "use_policy", "uuids_in",
+    "is_fake", "normalise_uuid", "queue_ref", "self_check", "set_policy", "use_policy", "uuids_in",
 ]
 
 
