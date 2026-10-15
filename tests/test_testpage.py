@@ -488,3 +488,18 @@ def test_v3_document_sequence_collate_and_duplex_are_visible_in_the_pages(need_v
     got = [(x["page"], x["copy"], x["side"]) for x in rep["pages"]]
     assert got == [(1, 1, "front"), (2, 1, "back"), (1, 2, "front"), (2, 2, "back")]
     assert all(x["is_test_page"] and x["page_order_ok"] and x["glyph_orientation"] == "upright" for x in rep["pages"])
+
+
+@pytest.mark.parametrize("f", [0.96, 1.04])
+def test_v3_page_placed_small_or_large_on_its_sheet_is_still_recognised(need_v3, f):
+    """A 4 % shrink / zoom of the page on a same-size sheet (a fit-to-page or a zoomed print) is the page, measured at f x."""
+    from PIL import Image
+
+    p = tp.PageParams(paper="letter")
+    r = ta.render_pdf_exact(tp.render_pdf(p).pdf, 150)
+    sheet = Image.new("RGB", r.img.size, (255, 255, 255))
+    sheet.paste(r.img.resize((round(r.img.width * f), round(r.img.height * f)), Image.Resampling.LANCZOS), (0, 0))
+    rep = ta.analyze_raster(ta.Raster(sheet, 150, 150, None, "test"), p, detail="fast")
+    s = rep["summary"]
+    assert rep["is_test_page"] and s["scale_x"] == pytest.approx(f, abs=0.004) and s["scale_y"] == pytest.approx(f, abs=0.004)
+    assert s["verdict_orientation"] == "upright"

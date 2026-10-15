@@ -170,6 +170,10 @@ _FIXES = [
 ]
 
 
+#: scales (of the true size) at which a page placed at the top-left corner is also tried by :func:`detect_orientation`
+_PLACEMENT_SCALES = (1.0, 0.97, 1.03, 0.94, 1.06)
+
+
 def _apply(img: Any, name: str | None) -> Any:
     if name is None:
         return img
@@ -200,11 +204,14 @@ def detect_orientation(raster_img: Any, ref_img: Any, cand_dpi: tuple[float, flo
         dx, dy = (cand_dpi[1], cand_dpi[0]) if swap else cand_dpi
         cl, cf = low(_apply(raster_img, name))
         stretched = cl.resize(ref.size, resample=Image.Resampling.BOX)
-        phys = cl.resize((max(1, round(cl.width * ref_pxmm / (dx / MM / cf))), max(1, round(cl.height * ref_pxmm / (dy / MM / cf)))),
-                         resample=Image.Resampling.BOX)
-        canvas = Image.new("L", ref.size, 255)
-        canvas.paste(phys, (0, 0))
-        d = min(ImageStat.Stat(ImageChops.difference(ImageOps.autocontrast(c), ref)).mean[0] for c in (stretched, canvas))
+        cands = [stretched]
+        for f in _PLACEMENT_SCALES:  # the page at its true size at the top-left, and placed a few percent small / large (a fit-to-page, a zoom)
+            phys = cl.resize((max(1, round(cl.width * ref_pxmm * f / (dx / MM / cf))), max(1, round(cl.height * ref_pxmm * f / (dy / MM / cf)))),
+                             resample=Image.Resampling.BOX)
+            canvas = Image.new("L", ref.size, 255)
+            canvas.paste(phys, (0, 0))
+            cands.append(canvas)
+        d = min(ImageStat.Stat(ImageChops.difference(ImageOps.autocontrast(c), ref)).mean[0] for c in cands)
         scores.append((d, name, label, rot, mir))
     order = sorted(scores, key=lambda t: t[0])
     best, second = order[0], order[1]
