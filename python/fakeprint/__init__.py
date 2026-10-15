@@ -25,6 +25,7 @@ from .soap import (
     parse_fault,
 )
 from .manager import BadRequest, Conflict, Forbidden, Manager, ManagerError, NotYet, PipeTransport, UnknownDevice
+from .requestlog import Body, Request, RequestPage, TicketSubstitution
 from .ticket import PrintTicket
 
 if TYPE_CHECKING:
@@ -57,6 +58,7 @@ __all__ = [
     "is_fake_uuid",
     "ActionNotSupported",
     "ApiError",
+    "Body",
     "Capture",
     "BadRequest",
     "Client",
@@ -79,10 +81,13 @@ __all__ = [
     "PrintClient",
     "PrintError",
     "PrintTicket",
+    "Request",
+    "RequestPage",
     "Server",
     "SoapFault",
     "Status",
     "Subscription",
+    "TicketSubstitution",
     "profiles",
     "start",
     "parse_fault",
