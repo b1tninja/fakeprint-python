@@ -25,6 +25,10 @@ jobs:
         with:
           repository: b1tninja/fakeprint
           path: fakeprint
+      - name: fetch WSD specs (licence accepted, test inputs only; they stay in the fakeprint checkout)
+        shell: pwsh
+        working-directory: fakeprint
+        run: ./scripts/Get-WsdSpecs.ps1 -AcceptLicense
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

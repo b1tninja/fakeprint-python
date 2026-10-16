@@ -113,6 +113,10 @@ jobs:
           "$py/python" -c "import fakeprint, fakeprint._native; print('imported', fakeprint.__file__)"
           "$py/fakeprint-ctl" --help > /dev/null
 
+      - name: no Microsoft specification files in the wheel
+        shell: bash
+        run: bash fakeprint-python/.github/scripts/check-artifacts.sh fakeprint-python/dist/*.whl
+
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
@@ -141,6 +145,14 @@ jobs:
         run: |
           sha=$(gh api "repos/b1tninja/fakeprint/commits/${{ env.FAKEPRINT_REF }}" --jq .sha)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          path: _repo
+
+      - name: no Microsoft specification files in any artifact
+        run: bash _repo/.github/scripts/check-artifacts.sh dist/*
 
       - name: checksums
         working-directory: dist
