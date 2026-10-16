@@ -154,7 +154,8 @@ def test_reconcile_from_windows_without_winprint_says_how_to_proceed(monkeypatch
     import fakeprint
 
     _, m = make()
-    monkeypatch.delattr(fakeprint, "winprint", raising=False)
+    if "winprint" in vars(fakeprint):  # vars() does not trigger the lazy import, which raises off Windows
+        monkeypatch.delattr(fakeprint, "winprint")
     monkeypatch.setitem(sys.modules, "fakeprint.winprint", None)  # as on a platform without ctypes/winspool
     with pytest.raises(RuntimeError, match="list_printers"):
         m.reconcile_from_windows()
