@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      # The native module depends on the fakeprint crate in the sibling repository.
+      - uses: actions/checkout@v4
+        with:
+          path: fakeprint-python
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja/fakeprint
+          path: fakeprint
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fakeprint-python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        shell: bash
+        working-directory: fakeprint-python
+        run: |
+          python -m venv .venv
+          if [[ "$RUNNER_OS" == "Windows" ]]; then . .venv/Scripts/activate; else . .venv/bin/activate; fi
+          pip install maturin pytest pillow httpx
+          maturin develop
+      - name: Test
+        shell: bash
+        working-directory: fakeprint-python
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then . .venv/Scripts/activate; else . .venv/bin/activate; fi
+          pytest -q
