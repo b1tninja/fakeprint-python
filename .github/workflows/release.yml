@@ -1,0 +1,190 @@
+name: release
+
+# Prebuilt fakeprint wheels, so nobody has to compile Rust.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# builds one abi3 wheel (CPython 3.10 and newer) per platform, installs each one in a clean
+# virtualenv as a smoke test, writes SHA256SUMS, attests build provenance and creates a DRAFT GitHub
+# release (publish it from the Releases page after a look). Install from a release with
+#
+#   pip install https://github.com/b1tninja/fakeprint-python/releases/download/v0.1.0/<wheel file>
+#
+# The native module depends on the fakeprint Rust crate in the sibling repository b1tninja/fakeprint,
+# checked out next to this one; `fakeprint_ref` (default main) picks the commit, and the commit used is
+# written into the release notes.
+#
+# Without a tag (workflow_dispatch, or a pull request that touches this file) it only builds and
+# uploads the wheels as workflow artifacts: a dry run, nothing is released.
+#
+# PyPI is off by default. To publish there too: claim the project name, add a trusted publisher
+# (workflow release.yml, environment pypi) and set the repository variable PUBLISH_TO_PYPI to true.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      fakeprint_ref:
+        description: "Commit, branch or tag of b1tninja/fakeprint to build against"
+        default: main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FAKEPRINT_REF: ${{ inputs.fakeprint_ref || 'main' }}
+
+jobs:
+  version:
+    name: check the tag matches the package version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: |
+          cargo_version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          py_version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' pyproject.toml | head -n1)
+          echo "version=$py_version" >> "$GITHUB_OUTPUT"
+          if [[ "$cargo_version" != "$py_version" ]]; then
+            echo "::error::Cargo.toml ($cargo_version) and pyproject.toml ($py_version) disagree"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/v}"
+            if [[ "$tag" != "$py_version" && "$tag" != "$py_version"-* ]]; then
+              echo "::error::tag v$tag does not match the package version $py_version"
+              exit 1
+            fi
+          fi
+
+  wheels:
+    name: wheel (${{ matrix.name }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64,    os: windows-latest,   target: x86_64-pc-windows-msvc,    manylinux: "" }
+          - { name: linux-x64,      os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  manylinux: auto }
+          - { name: linux-arm64,    os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, manylinux: auto }
+          - { name: macos-arm64,    os: macos-latest,     target: aarch64-apple-darwin,      manylinux: "" }
+          - { name: macos-x64,      os: macos-latest,     target: x86_64-apple-darwin,       manylinux: "" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fakeprint-python
+
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja/fakeprint
+          ref: ${{ env.FAKEPRINT_REF }}
+          path: fakeprint
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: fakeprint-python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+          rust-toolchain: stable
+
+      - name: smoke test (native targets only)
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then py="$RUNNER_TEMP/smoke/Scripts"; else py="$RUNNER_TEMP/smoke/bin"; fi
+          "$py/python" -m pip install --quiet fakeprint-python/dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$py/python" -c "import fakeprint, fakeprint._native; print('imported', fakeprint.__file__)"
+          "$py/fakeprint-ctl" --help > /dev/null
+
+      - name: no Microsoft specification files in the wheel
+        shell: bash
+        run: bash fakeprint-python/.github/scripts/check-artifacts.sh fakeprint-python/dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: fakeprint-python/dist/*.whl
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: resolve the fakeprint commit that was built
+        id: rust
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api "repos/b1tninja/fakeprint/commits/${{ env.FAKEPRINT_REF }}" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          path: _repo
+
+      - name: no Microsoft specification files in any artifact
+        run: bash _repo/.github/scripts/check-artifacts.sh dist/*
+
+      - name: checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
+
+      - name: create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease="--prerelease"
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --draft $prerelease \
+            --title "fakeprint (Python) $GITHUB_REF_NAME" \
+            --notes "Prebuilt wheels (CPython 3.10+, abi3) for Windows x64, Linux x64 and arm64, and macOS arm64 and x64. Install one with \`pip install <wheel url>\`. Built against b1tninja/fakeprint@${{ steps.rust.outputs.sha }}. Verify with \`sha256sum -c SHA256SUMS\` or \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`."
+
+  pypi:
+    name: publish to PyPI (opt in)
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_TO_PYPI == 'true'
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
