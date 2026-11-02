@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -30,7 +31,8 @@ from .client import DEFAULT_BASE_URL
 from .manager import is_loopback_url
 
 EXE_ENV = "FAKEPRINT_EXE"
-KNOWN_DAEMON_DIR = Path(r"D:\temp\fakeprint-daemon")
+# Where an installed daemon lives: the system temporary folder.
+KNOWN_DAEMON_DIR = Path(tempfile.gettempdir()) / "fakeprint-daemon"
 DEFAULT_PORT = 3921
 
 

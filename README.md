@@ -19,9 +19,9 @@ generator.
 ## Build and test
 
 ```powershell
-cd D:\code\fakeprint-python
-$env:CARGO_TARGET_DIR = "D:/temp/fakeprint-target-py"   # keep cargo output out of the repo
-$env:VIRTUAL_ENV = "D:\code\pdfcraft-python\.venv"
+cd fakeprint-python   # beside a fakeprint checkout
+$env:CARGO_TARGET_DIR = "$env:TEMP/fakeprint-target-py"   # keep cargo output out of the repo
+python -m venv .venv; .venv\Scripts\Activate.ps1
 maturin develop                                         # builds src/lib.rs against ../fakeprint
 python -m pytest                                        # native tests skip when _native is not built
 ```

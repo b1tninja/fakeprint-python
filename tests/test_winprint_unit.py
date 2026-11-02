@@ -373,9 +373,9 @@ def test_list_printers_read_only(spool):
 
 
 def test_list_printers_reports_the_location(spool):
-    spool.printers = [("Fake WSD printer", "WSD-3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b", "Drv", 0, "http://192.168.1.70:3921/WebServices/Device")]
+    spool.printers = [("Fake WSD printer", "WSD-3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b", "Drv", 0, "http://192.168.1.10:3921/WebServices/Device")]
     (p,) = wp.list_printers()
-    assert p.location == "http://192.168.1.70:3921/WebServices/Device"
+    assert p.location == "http://192.168.1.10:3921/WebServices/Device"
 
 
 def test_wsd_port_uuid_reads_only_wsd_ports_and_never_raises():
